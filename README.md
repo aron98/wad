@@ -7,7 +7,7 @@ Isolated development environments using git worktrees and Docker.
 - Creates git worktrees for parallel development
 - Runs each worktree in a devcontainer (add sidecars like postgres via `.wad/compose.yml`)
 - Keeps each environment isolated via a dedicated Docker network
-- Starts an interactive coding agent session (goose) inside the devcontainer
+- Runs a **background goose task** inside the devcontainer (non-interactive `goose run --no-session --recipe ...`) and lets you attach
 
 ## Requirements
 
@@ -23,46 +23,57 @@ cd wad
 ./install.sh
 ```
 
-## Quick Start
+## Quick Start (new simplified flow)
 
 ```bash
 cd your-project
-wad init                    # Creates .wad/config.yml
-# Edit .wad/config.yml for your project
-wad new feature-x           # Create environment
-wad run feature-x           # Start services
-wad agent start feature-x "help me understand this repo"   # Start coding agent session
-wad agent attach feature-x                           # Attach/reconnect to agent (interactive TTY)
+wad init
+# Edit .wad/compose.yml (your devcontainer + sidecars)
+# Edit .wad/config.yml (ports, services, goose settings)
+
+wad new "add a healthcheck endpoint and tests"
+# wad prints the generated environment name
+
+wad attach <env>           # watch goose + logs (tmux)
+wad status <env>           # check goose completion + show JSON result (if any)
+wad logs <env> goose       # tail /tmp/goose.log without attaching
 ```
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `wad init` | Initialize wad in current repo |
-| `wad new <name>` | Create new environment |
+| `wad init` | Initialize wad in current repo (writes templates + builds the local name generator image) |
+| `wad new "<prompt>"` | Create a new environment from a prompt: generates env name, creates worktree, starts containers + services, starts goose task in background |
+| `wad attach <env>` | Attach to the tmux session inside the devcontainer (requires a real TTY) |
+| `wad status <env>` | Show goose task status and (if available) the structured result JSON |
 | `wad ls` | List environments |
-| `wad start <name>` | Start containers |
-| `wad stop <name>` | Stop containers |
-| `wad rm <name>` | Remove environment |
-| `wad shell <name>` | Enter container bash |
-| `wad run <name>` | Start services |
-| `wad logs <name> [svc]` | View logs |
-| `wad agent start <env> "<prompt>"` | Start (or reuse) the coding agent tmux session and send a prompt |
-| `wad agent attach <env>` | Attach to the agent tmux session (requires a real TTY) |
-| `wad agent status <env>` | Print `running`/`stopped` |
-| `wad agent stop <env>` | Stop the agent tmux session |
+| `wad start <env>` | Start containers |
+| `wad stop <env>` | Stop containers |
+| `wad rm <env> [--force]` | Remove environment |
+| `wad shell <env>` | Enter container bash |
+| `wad run <env>` | Start services (from config.yml) |
+| `wad logs <env> [svc|goose]` | View logs (use `goose` to tail `/tmp/goose.log`) |
+
+### Parseable env name output
+
+`wad new` prints a final machine-parseable line:
+
+```text
+ENV=<env>
+```
+
 
 ## Configuration
 
 After `wad init`, edit `.wad/config.yml`:
 
 ```yaml
-version: 2
+version: 3
 
-worktrees:
-  # Optional. If omitted, wad will use your current branch, then main/master, then HEAD.
-  default_base: main
+namegen:
+  image: wad-namegen:local
+  timeout_seconds: 2
 
 ports:
   increment: 10
@@ -76,26 +87,39 @@ services:
     command: python main.py
     log: /tmp/app.log
 
-# Coding agent (runs inside the devcontainer)
 agent:
-  # For now, only `goose` is supported.
   type: goose
-
-  # Extra env vars for the agent (gitignored by default)
   env_file: .wad/agent.env
-
-  # tmux session name used for start/attach/stop
   session_name: wad-agent
-
   goose:
-    # Directory copied into /root/.config/goose at container start
     config_dir: .wad/goose
 ```
 
-### Coding agent environment
+### Unattended execution (recipes)
+
+WAD runs goose in **unattended** mode by default (no additional human input expected).
+
+On `wad init`, WAD creates a generic recipe:
+
+- `.wad/goose/recipes/wad_task.yaml`
+
+On `wad new "<prompt>"`, WAD runs:
+
+```bash
+goose run --no-session \
+  --recipe /workspace/.wad/goose/recipes/wad_task.yaml \
+  --params task=/tmp/wad-prompt
+```
+
+This recipe:
+- instructs goose not to ask questions or wait for user input
+- requires it to always finish with a structured JSON result (`completed` or `blocked`)
+
+
+### Goose environment
 
 Edit `.wad/agent.env` (created by `wad init`, gitignored by default). Put your provider/model/etc here.
-For example, for goose:
+For example:
 
 ```bash
 # .wad/agent.env
@@ -113,25 +137,27 @@ So you can commit safe defaults in `.wad/goose` (if you choose to), or keep it u
 
 Note: because this is **copy** semantics (not a bind mount), edits made inside the container to `/root/.config/goose` will not sync back to your repo.
 
-### Attaching and logs
-`wad agent attach <env>` attaches you to the **interactive goose session** (the tmux window named `agent`).
+## Attaching and logs
 
-The tmux session also creates a `logs` window that tails service log files:
-- If you set `services.<name>.log` in `.wad/config.yml`, it will tail that.
-- Otherwise it defaults to `/tmp/<service>.log`.
+- `wad new "<prompt>"` starts goose in a detached tmux session (`agent.session_name`, default `wad-agent`).
+- `wad attach <env>` attaches you to the tmux session.
+- The tmux session also creates a `logs` window that tails:
+  - `/tmp/goose.log`
+  - each configured service log file (`services.<name>.log`), or `/tmp/<service>.log` by default
 
 To switch windows while attached:
-- `Ctrl+b` then `1` → `logs`
-- `Ctrl+b` then `0` → `agent`
 
-For the agent to see app console output reliably, start services via `wad run`.
+- `Ctrl+b` then `0` → `agent`
+- `Ctrl+b` then `1` → `logs`
 
 ## How it works
 
-1. `wad new` creates a git worktree and generates a docker-compose file
-2. The devcontainer mounts your worktree and shared dependencies
-3. `wad run` starts your services inside the container
-4. `wad agent start` starts a tmux-based coding agent session inside the devcontainer
+1. `wad new "<prompt>"` generates an env name (via a small local helper image built at `wad init`)
+2. Creates a git worktree at `.worktrees/<env>` with branch `wad/<env>`
+3. Generates `.wad-env` and `.wad-compose.yml` for the worktree
+4. Starts the devcontainer (and any sidecars)
+5. Starts your configured services inside the devcontainer
+6. Launches `goose run --no-session --recipe /workspace/.wad/goose/recipes/wad_task.yaml --params task=/tmp/wad-prompt` inside tmux and returns immediately
 
 ## License
 

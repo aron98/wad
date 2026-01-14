@@ -1,3 +1,4 @@
 .env
 agent.env
 goose/
+namegen/

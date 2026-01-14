@@ -25,7 +25,7 @@ services:
           if [ -n "$$need_pkgs" ]; then
             export DEBIAN_FRONTEND=noninteractive;
             apt-get update -qq >/dev/null;
-            apt-get install -y -qq curl ca-certificates bzip2 tar tmux >/dev/null;
+            apt-get install -y -qq curl ca-certificates bzip2 tar tmux libxcb1 >/dev/null;
             rm -rf /var/lib/apt/lists/*;
           fi;
         fi;

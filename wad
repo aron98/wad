@@ -76,6 +76,46 @@ slugify() {
     printf '%s' "$s"
 }
 
+make_title_from_prompt() {
+    # Heuristic fallback title generator: first ~8 words.
+    local p="$*"
+    p=$(printf '%s' "$p" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ +//; s/ +$//')
+    p=$(printf '%s' "$p" | awk '{out=""; for(i=1;i<=NF && i<=8;i++){out=out (i==1?"":" ") $i} print out}')
+    [[ -z "$p" ]] && p="Task"
+    printf '%s' "$p"
+}
+
+extract_last_json_object() {
+    # Extract the last JSON object from arbitrary stdout.
+    # Prints the JSON object or nothing.
+    python - <<'PY'
+import json, sys
+s = sys.stdin.read()
+
+for i in range(len(s) - 1, -1, -1):
+    if s[i] != '}':
+        continue
+    depth = 0
+    for j in range(i, -1, -1):
+        c = s[j]
+        if c == '}':
+            depth += 1
+        elif c == '{':
+            depth -= 1
+            if depth == 0:
+                candidate = s[j:i+1]
+                try:
+                    json.loads(candidate)
+                except Exception:
+                    break
+                print(candidate)
+                sys.exit(0)
+
+sys.exit(0)
+PY
+}
+
+
 ensure_unique_env_name() {
     local repo_root="$1" base="$2"
     local i=1 name="$base"
@@ -175,7 +215,7 @@ FROM debian:bookworm-slim
 ARG TARGETARCH
 
 RUN apt-get update -qq \
-  && apt-get install -y -qq curl ca-certificates bzip2 tar \
+  && apt-get install -y -qq curl ca-certificates bzip2 tar libxcb1 \
   && rm -rf /var/lib/apt/lists/*
 
 # Install goose
@@ -213,6 +253,10 @@ ensure_namegen_image() {
 }
 
 sample_env_name_from_prompt() {
+    # Returns only the slug (suitable for env/branch/worktree names).
+    # Also sets:
+    #   WAD_LAST_NAMEGEN_TITLE
+    #   WAD_LAST_NAMEGEN_SLUG
     local repo_root="$1" prompt="$2"
 
     ensure_namegen_image "$repo_root"
@@ -225,19 +269,22 @@ sample_env_name_from_prompt() {
     local goose_cfg="$repo_root/$WAD_DIR/goose"
 
     local cname="wad-namegen-$$-$RANDOM"
-    local tmp_out
+    local tmp_out tmp_prompt
     tmp_out=$(mktemp)
+    tmp_prompt=$(mktemp)
+    printf '%s' "$prompt" > "$tmp_prompt"
 
     # Run name generation in the background so we can enforce a soft timeout without external deps.
+    # Uses a recipe that MUST emit JSON: {"slug": "...", "title": "..."}
     (
       docker run \
         --name "$cname" \
         --rm \
         --env-file "$agent_env" \
-        -e WAD_PROMPT="$prompt" \
         -v "$goose_cfg:/root/.config/goose:ro" \
+        -v "$tmp_prompt:/tmp/wad-prompt:ro" \
         "$image" \
-        'goose run --no-session -t "Given the prompt: $WAD_PROMPT. Respond with ONLY a short kebab-case slug (lowercase letters, numbers, hyphens). No other text."'
+        'goose run --no-session --recipe /root/.config/goose/recipes/wad_namegen.yaml --params prompt=/tmp/wad-prompt'
     ) >"$tmp_out" 2>/dev/null &
 
     local pid=$!
@@ -251,13 +298,27 @@ sample_env_name_from_prompt() {
         sleep 0.1
     done
 
-    local out
+    local out json slug title
     out=$(cat "$tmp_out" 2>/dev/null || true)
     rm -f "$tmp_out" || true
+    rm -f "$tmp_prompt" || true
 
-    # Always normalize output (or fallback to prompt-based slug)
-    out=$(slugify "${out:-$prompt}")
-    echo "$out"
+    json=$(printf '%s' "$out" | extract_last_json_object || true)
+    if [[ -n "$json" ]]; then
+        slug=$(python -c 'import json,sys; print(json.loads(sys.stdin.read()).get("slug",""))' <<<"$json" 2>/dev/null || true)
+        title=$(python -c 'import json,sys; print(json.loads(sys.stdin.read()).get("title",""))' <<<"$json" 2>/dev/null || true)
+    fi
+
+    # Fallbacks: deterministic title + slugify
+    [[ -z "$title" ]] && title=$(make_title_from_prompt "$prompt")
+    [[ -z "$slug" ]] && slug=$(slugify "$title")
+    [[ -z "$slug" ]] && slug=$(slugify "$prompt")
+
+    # Expose last title for callers that want to display it.
+    WAD_LAST_NAMEGEN_TITLE="$title"
+    WAD_LAST_NAMEGEN_SLUG="$slug"
+
+    echo "$slug"
 }
 
 # =============================================================================
@@ -468,9 +529,12 @@ start_goose_task() {
         tmux send-keys -t "$agent_target" -- "[[ -f /workspace/.wad/.env ]] && set -a && source /workspace/.wad/.env && set +a" Enter
         tmux send-keys -t "$agent_target" -- "[[ -f /workspace/$WAD_AGENT_ENV_FILE ]] && set -a && source /workspace/$WAD_AGENT_ENV_FILE && set +a" Enter
 
+        # Reset completion markers for this run.
+        tmux send-keys -t "$agent_target" -- "rm -f /tmp/wad-goose-done /tmp/wad-goose-exit /tmp/wad-goose-out.log /tmp/wad-goose-result.json" Enter
+
         # Run goose via the WAD unattended task recipe and log output.
         # Pass the prompt via a file param so we do not fight shell quoting.
-        tmux send-keys -t "$agent_target" -- "(goose run --no-session --recipe /workspace/.wad/goose/recipes/wad_task.yaml --params task=/tmp/wad-prompt 2>&1 | tee -a /tmp/goose.log)" Enter
+        tmux send-keys -t "$agent_target" -- "(goose run --no-session --recipe /workspace/.wad/goose/recipes/wad_task.yaml --params task=/tmp/wad-prompt 2>&1 | tee /tmp/wad-goose-out.log | tee -a /tmp/goose.log; ec=\${PIPESTATUS[0]}; echo \"\$ec\" > /tmp/wad-goose-exit; touch /tmp/wad-goose-done)" Enter
       '
 
     log_success "Goose started in background (tmux session: $session_name)"
@@ -536,8 +600,8 @@ namegen/
 EOF
     fi
 
-    # Empty env file
-    if [[ "$mode" == "--force" || ! -f "$repo_root/$WAD_DIR/.env" ]]; then
+    # Empty env file (gitignored by default). Even with --force, do NOT clobber.
+    if [[ ! -f "$repo_root/$WAD_DIR/.env" ]]; then
         cat > "$repo_root/$WAD_DIR/.env" << 'EOF'
 # WAD Environment Variables (gitignored - safe for secrets)
 # Sourced by: wad run
@@ -545,8 +609,8 @@ EOF
 EOF
     fi
 
-    # Agent environment file (gitignored by default)
-    if [[ "$mode" == "--force" || ! -f "$repo_root/$WAD_DIR/agent.env" ]]; then
+    # Agent environment file (gitignored by default). Even with --force, do NOT clobber.
+    if [[ ! -f "$repo_root/$WAD_DIR/agent.env" ]]; then
         cat > "$repo_root/$WAD_DIR/agent.env" << 'EOF'
 # Environment variables for goose (sourced inside the devcontainer before running goose)
 # Examples (uncomment and edit):
@@ -601,7 +665,8 @@ EOF
 
     # Goose global config (gitignored by default).
     mkdir -p "$repo_root/$WAD_DIR/goose"
-    if [[ "$mode" == "--force" || ! -f "$repo_root/$WAD_DIR/goose/config.yaml" ]]; then
+    # Even with --force, do NOT clobber. This is where provider/model may live.
+    if [[ ! -f "$repo_root/$WAD_DIR/goose/config.yaml" ]]; then
         cat > "$repo_root/$WAD_DIR/goose/config.yaml" << 'EOF'
 GOOSE_PROVIDER:
 GOOSE_MODEL:
@@ -652,7 +717,56 @@ EOF
     # Stored under the goose config dir so it is available in-container at:
     #   /workspace/.wad/goose/recipes/wad_task.yaml
     mkdir -p "$repo_root/$WAD_DIR/goose/recipes"
-    if [[ "$mode" == "--force" || ! -f "$repo_root/$WAD_DIR/goose/recipes/wad_task.yaml" ]]; then
+
+
+    # WAD name generator recipe (used by the namegen helper container)
+    # Available at:
+    #   - host repo: .wad/goose/recipes/wad_namegen.yaml
+    #   - namegen container (via bind mount): /root/.config/goose/recipes/wad_namegen.yaml
+    # Recipes are user-tweakable; do not clobber even with --force.
+    if [[ ! -f "$repo_root/$WAD_DIR/goose/recipes/wad_namegen.yaml" ]]; then
+        cat > "$repo_root/$WAD_DIR/goose/recipes/wad_namegen.yaml" << 'EOF'
+version: "1.0.0"
+title: "WAD Name Generator"
+description: "Convert a prompt into a short slug + human-friendly title."
+
+parameters:
+  - key: prompt
+    input_type: file
+    requirement: required
+    description: "Path to a file containing the user prompt"
+
+prompt: |
+  You are generating a name for a git worktree / branch.
+
+  Input:
+  {{ prompt }}
+
+  Requirements:
+  - Return ONLY valid JSON that matches the schema.
+  - slug must be kebab-case: lowercase letters, numbers, hyphens.
+  - slug must be short (<= 48 chars) and descriptive.
+  - title should be a short human-friendly title (<= ~60 chars).
+
+response:
+  json_schema:
+    type: object
+    additionalProperties: false
+    properties:
+      slug:
+        type: string
+        description: "kebab-case slug (lowercase letters, numbers, hyphens)"
+      title:
+        type: string
+        description: "short human-friendly title"
+    required:
+      - slug
+      - title
+EOF
+    fi
+
+    # Recipes are user-tweakable; do not clobber even with --force.
+    if [[ ! -f "$repo_root/$WAD_DIR/goose/recipes/wad_task.yaml" ]]; then
         cat > "$repo_root/$WAD_DIR/goose/recipes/wad_task.yaml" << 'EOF'
 version: "1.0.0"
 title: "WAD Unattended Task"
@@ -775,7 +889,7 @@ services:
           if [ -n "$$need_pkgs" ]; then
             export DEBIAN_FRONTEND=noninteractive;
             apt-get update -qq >/dev/null;
-            apt-get install -y -qq curl ca-certificates bzip2 tar tmux >/dev/null;
+            apt-get install -y -qq curl ca-certificates bzip2 tar tmux libxcb1 >/dev/null;
             rm -rf /var/lib/apt/lists/*;
           fi;
         fi;
@@ -828,6 +942,11 @@ cmd_new() {
     base_slug=$(slugify "$suggested")
     env_name=$(ensure_unique_env_name "$repo_root" "$base_slug")
     worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
+
+    # Optional: show the human-friendly title if namegen produced one
+    if [[ -n "${WAD_LAST_NAMEGEN_TITLE:-}" ]]; then
+        log_info "Name: ${WAD_LAST_NAMEGEN_TITLE}"
+    fi
 
     log_header "Creating environment: $env_name"
 
@@ -892,7 +1011,11 @@ cmd_new() {
 
     log_info "Next:"
     echo "  wad attach $env_name        # Watch goose + logs (tmux; requires a real TTY)"
+    echo "  wad status $env_name        # Check goose completion + show JSON result (if any)"
     echo "  wad logs $env_name goose    # Tail goose log (/tmp/goose.log)"
+
+    # Machine-parseable last line
+    echo "ENV=$env_name"
 }
 
 cmd_attach() {
@@ -915,6 +1038,73 @@ cmd_attach() {
     fi
 
     docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec devcontainer tmux attach -t "${session_name}:agent"
+}
+
+
+cmd_status() {
+    local env_name="$1"
+    [[ -z "$env_name" ]] && die "Usage: wad status <env>"
+
+    local repo_root
+    repo_root=$(check_wad_init)
+
+    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
+    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
+
+    require_env_running "$worktree_path" "$env_name" || exit 1
+
+    local done running exit_code
+
+    done=$(docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T devcontainer bash -lc "test -f /tmp/wad-goose-done && echo yes || echo no" 2>/dev/null || echo no)
+    exit_code=$(docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T devcontainer bash -lc "cat /tmp/wad-goose-exit 2>/dev/null || true" 2>/dev/null || true)
+    running=$(docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T devcontainer bash -lc "pgrep -af 'goose run --no-session --recipe /workspace/.wad/goose/recipes/wad_task.yaml' >/dev/null 2>&1 && echo yes || echo no" 2>/dev/null || echo no)
+
+    echo -e "${BOLD}Status:${NC} $env_name"
+    echo "  running: $running"
+    echo "  done:    $done"
+    [[ -n "$exit_code" ]] && echo "  exit:    $exit_code"
+
+    if [[ "$done" == "yes" ]]; then
+        echo ""
+        echo -e "${BOLD}Result (if any):${NC}"
+        docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T devcontainer bash -lc '
+          if [ ! -s /tmp/wad-goose-out.log ]; then
+            echo "(no goose output log found)"
+            exit 0
+          fi
+
+          python - <<"PY" >/tmp/wad-goose-result.json 2>/dev/null || true
+import json
+
+s = open("/tmp/wad-goose-out.log", "r", errors="ignore").read()
+for i in range(len(s)-1, -1, -1):
+    if s[i] != "}":
+        continue
+    depth = 0
+    for j in range(i, -1, -1):
+        c = s[j]
+        if c == "}":
+            depth += 1
+        elif c == "{":
+            depth -= 1
+            if depth == 0:
+                cand = s[j:i+1]
+                try:
+                    json.loads(cand)
+                except Exception:
+                    break
+                print(cand)
+                raise SystemExit(0)
+raise SystemExit(2)
+PY
+
+          if [ -s /tmp/wad-goose-result.json ]; then
+            python -m json.tool /tmp/wad-goose-result.json 2>/dev/null || cat /tmp/wad-goose-result.json
+          else
+            echo "(no structured JSON result found)"
+          fi
+        '
+    fi
 }
 
 cmd_ls() {
@@ -1188,6 +1378,7 @@ ${BOLD}COMMANDS${NC}
   init                     Initialize wad in current repo (also builds the namegen image)
   new "<prompt>"            Create a new environment for the prompt
   attach <env>             Attach to goose tmux session inside the devcontainer
+  status <env>             Show goose task status and (if available) the structured result JSON
   ls                       List environments
 
   start <env>              Start containers
@@ -1210,6 +1401,7 @@ case "${1:-help}" in
     init)    cmd_init "${@:2}" ;;
     new)     cmd_new "${@:2}" ;;
     attach)  cmd_attach "${@:2}" ;;
+    status)  cmd_status "${@:2}" ;;
     ls)      cmd_ls ;;
     start)   cmd_start "${@:2}" ;;
     stop)    cmd_stop "${@:2}" ;;

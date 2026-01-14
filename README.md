@@ -7,7 +7,7 @@ Isolated development environments using git worktrees and Docker.
 - Creates git worktrees for parallel development
 - Runs each worktree in a devcontainer (add sidecars like postgres via `.wad/compose.yml`)
 - Keeps each environment isolated via a dedicated Docker network
-- Runs a **background goose task** inside the devcontainer (non-interactive `goose run -t ...`) and lets you attach
+- Runs a **background goose task** inside the devcontainer (non-interactive `goose run --no-session --recipe ...`) and lets you attach
 
 ## Requirements
 
@@ -35,6 +35,7 @@ wad new "add a healthcheck endpoint and tests"
 # wad prints the generated environment name
 
 wad attach <env>           # watch goose + logs (tmux)
+wad status <env>           # check goose completion + show JSON result (if any)
 wad logs <env> goose       # tail /tmp/goose.log without attaching
 ```
 
@@ -45,6 +46,7 @@ wad logs <env> goose       # tail /tmp/goose.log without attaching
 | `wad init` | Initialize wad in current repo (writes templates + builds the local name generator image) |
 | `wad new "<prompt>"` | Create a new environment from a prompt: generates env name, creates worktree, starts containers + services, starts goose task in background |
 | `wad attach <env>` | Attach to the tmux session inside the devcontainer (requires a real TTY) |
+| `wad status <env>` | Show goose task status and (if available) the structured result JSON |
 | `wad ls` | List environments |
 | `wad start <env>` | Start containers |
 | `wad stop <env>` | Stop containers |
@@ -52,6 +54,15 @@ wad logs <env> goose       # tail /tmp/goose.log without attaching
 | `wad shell <env>` | Enter container bash |
 | `wad run <env>` | Start services (from config.yml) |
 | `wad logs <env> [svc|goose]` | View logs (use `goose` to tail `/tmp/goose.log`) |
+
+### Parseable env name output
+
+`wad new` prints a final machine-parseable line:
+
+```text
+ENV=<env>
+```
+
 
 ## Configuration
 

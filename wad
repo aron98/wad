@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
-# wad - Worktree Agent Devcontainers v2.4
+# wad - Worktree Agent Devcontainers v3
 # Isolated development environments using git worktrees + docker compose
 #
-# Configuration:
-#   .wad/compose.yml  - Docker compose template (full syntax)
-#   .wad/config.yml   - WAD settings (ports, services)
-#   .wad/.env         - Environment variables (gitignored)
+# Primary UX:
+#   wad init
+#   # edit .wad/compose.yml and .wad/config.yml
+#   wad new "<prompt>"   # creates env, starts containers+services, launches goose task in background
+#   wad attach <env>      # attach to tmux session in the devcontainer to watch progress
 #
 
 set -e
@@ -20,11 +21,14 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 BOLD='\033[1m'
 
-WAD_VERSION="2.4.0"
+WAD_VERSION="3.0.0"
 WAD_DIR=".wad"
 WAD_WORKTREES_DIR=".worktrees"
 WAD_CONFIG_FILE="config.yml"
 WAD_COMPOSE_TEMPLATE="compose.yml"
+
+WAD_NAMEGEN_DIR="namegen"
+WAD_NAMEGEN_DEFAULT_IMAGE="wad-namegen:local"
 
 log_info() { echo -e "${BLUE}ℹ${NC} $1"; }
 log_success() { echo -e "${GREEN}✓${NC} $1"; }
@@ -47,13 +51,43 @@ escape_sed_replacement() {
     printf '%s' "$1" | sed -e 's/\\\\/\\\\\\\\/g' -e 's/&/\\\\&/g' -e 's/|/\\\\|/g'
 }
 
-
 check_wad_init() {
     local repo_root
     repo_root=$(find_repo_root) || die "Not in a git repository"
     [[ -d "$repo_root/$WAD_DIR" ]] || die "WAD not initialized. Run 'wad init' first."
     [[ -f "$repo_root/$WAD_DIR/$WAD_COMPOSE_TEMPLATE" ]] || die "Missing $WAD_DIR/$WAD_COMPOSE_TEMPLATE"
     echo "$repo_root"
+}
+
+slugify() {
+    # Convert arbitrary text to a safe kebab-case slug suitable for:
+    # - directory names
+    # - compose project suffixes
+    # - git branch suffixes
+    local s="$*"
+    s=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')
+    # Replace any non-alnum with '-'
+    s=$(printf '%s' "$s" | sed -E 's/[^a-z0-9]+/-/g')
+    # Collapse repeated '-', trim leading/trailing '-'
+    s=$(printf '%s' "$s" | sed -E 's/-+/-/g; s/^-+//; s/-+$//')
+    # Limit length (avoid absurdly long branch/worktree names)
+    s=$(printf '%s' "$s" | cut -c1-48)
+    [[ -z "$s" ]] && s="env"
+    printf '%s' "$s"
+}
+
+ensure_unique_env_name() {
+    local repo_root="$1" base="$2"
+    local i=1 name="$base"
+    while :; do
+        if [[ -d "$repo_root/$WAD_WORKTREES_DIR/$name" ]] || git -C "$repo_root" show-ref --verify --quiet "refs/heads/wad/$name"; then
+            i=$((i + 1))
+            name="${base}-${i}"
+            continue
+        fi
+        echo "$name"
+        return 0
+    done
 }
 
 # =============================================================================
@@ -74,7 +108,7 @@ yaml_get() {
         function strip_quotes(s){
             s = trim(s)
             if (s ~ /^\".*\"$/) { sub(/^\"/, "", s); sub(/\"$/, "", s) }
-            else if (substr(s, 1, 1) == "'" && substr(s, length(s), 1) == "'") { s = substr(s, 2, length(s)-2) }
+            else if (substr(s, 1, 1) == "\x27" && substr(s, length(s), 1) == "\x27") { s = substr(s, 2, length(s)-2) }
             return s
         }
         function set_stack(level, k,    i){
@@ -124,6 +158,109 @@ get_config() {
 }
 
 # =============================================================================
+# Name generator (prompt -> env/worktree name)
+# =============================================================================
+
+build_namegen_image() {
+    local repo_root="$1"
+
+    local image
+    image=$(get_config "$repo_root" "namegen.image" "$WAD_NAMEGEN_DEFAULT_IMAGE")
+
+    mkdir -p "$repo_root/$WAD_DIR/$WAD_NAMEGEN_DIR"
+
+    cat > "$repo_root/$WAD_DIR/$WAD_NAMEGEN_DIR/Dockerfile" << 'EOF'
+FROM debian:bookworm-slim
+
+ARG TARGETARCH
+
+RUN apt-get update -qq \
+  && apt-get install -y -qq curl ca-certificates bzip2 tar \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install goose
+RUN set -e; \
+  case "${TARGETARCH}" in \
+    amd64) goose_url="https://github.com/block/goose/releases/latest/download/goose-x86_64-unknown-linux-gnu.tar.bz2" ;; \
+    arm64) goose_url="https://github.com/block/goose/releases/latest/download/goose-aarch64-unknown-linux-gnu.tar.bz2" ;; \
+    *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+  esac; \
+  tmp=$(mktemp -d); \
+  curl -fsSL "$goose_url" -o "$tmp/goose.tar.bz2"; \
+  tar -xjf "$tmp/goose.tar.bz2" -C "$tmp"; \
+  install -m 0755 "$tmp/goose" /usr/local/bin/goose; \
+  rm -rf "$tmp"
+
+WORKDIR /work
+
+ENTRYPOINT ["/bin/bash", "-lc"]
+CMD ["echo ready"]
+EOF
+
+    log_info "Building name generator image: $image"
+    docker build -t "$image" "$repo_root/$WAD_DIR/$WAD_NAMEGEN_DIR" >/dev/null
+    log_success "Built: $image"
+}
+
+ensure_namegen_image() {
+    local repo_root="$1"
+    local image
+    image=$(get_config "$repo_root" "namegen.image" "$WAD_NAMEGEN_DEFAULT_IMAGE")
+
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        build_namegen_image "$repo_root"
+    fi
+}
+
+sample_env_name_from_prompt() {
+    local repo_root="$1" prompt="$2"
+
+    ensure_namegen_image "$repo_root"
+
+    local image timeout_seconds
+    image=$(get_config "$repo_root" "namegen.image" "$WAD_NAMEGEN_DEFAULT_IMAGE")
+    timeout_seconds=$(get_config "$repo_root" "namegen.timeout_seconds" "2")
+
+    local agent_env="$repo_root/$WAD_DIR/agent.env"
+    local goose_cfg="$repo_root/$WAD_DIR/goose"
+
+    local cname="wad-namegen-$$-$RANDOM"
+    local tmp_out
+    tmp_out=$(mktemp)
+
+    # Run name generation in the background so we can enforce a soft timeout without external deps.
+    (
+      docker run \
+        --name "$cname" \
+        --rm \
+        --env-file "$agent_env" \
+        -e WAD_PROMPT="$prompt" \
+        -v "$goose_cfg:/root/.config/goose:ro" \
+        "$image" \
+        'goose run --no-session -t "Given the prompt: $WAD_PROMPT. Respond with ONLY a short kebab-case slug (lowercase letters, numbers, hyphens). No other text."'
+    ) >"$tmp_out" 2>/dev/null &
+
+    local pid=$!
+    local i=0
+    while kill -0 "$pid" >/dev/null 2>&1; do
+        i=$((i + 1))
+        if [[ $i -ge $((timeout_seconds * 10)) ]]; then
+            docker rm -f "$cname" >/dev/null 2>&1 || true
+            break
+        fi
+        sleep 0.1
+    done
+
+    local out
+    out=$(cat "$tmp_out" 2>/dev/null || true)
+    rm -f "$tmp_out" || true
+
+    # Always normalize output (or fallback to prompt-based slug)
+    out=$(slugify "${out:-$prompt}")
+    echo "$out"
+}
+
+# =============================================================================
 # Port Management
 # =============================================================================
 
@@ -133,7 +270,8 @@ get_next_env_index() {
     env_files=$(ls "$repo_root/$WAD_WORKTREES_DIR"/*/.wad-env 2>/dev/null || true)
     for env_file in $env_files; do
         [[ -f "$env_file" ]] || continue
-        local idx=$(grep "^WAD_ENV_INDEX=" "$env_file" 2>/dev/null | cut -d= -f2)
+        local idx
+        idx=$(grep "^WAD_ENV_INDEX=" "$env_file" 2>/dev/null | cut -d= -f2)
         [[ -n "$idx" && "$idx" -gt "$max_index" ]] && max_index="$idx"
     done
     echo $((max_index + 1))
@@ -142,14 +280,15 @@ get_next_env_index() {
 generate_env_file() {
     local env_name="$1" env_index="$2" repo_root="$3"
     local config="$repo_root/$WAD_DIR/$WAD_CONFIG_FILE"
-    local increment=$(get_config "$repo_root" "ports.increment" "10")
-    
+    local increment
+    increment=$(get_config "$repo_root" "ports.increment" "10")
+
     cat << EOF
 # WAD Environment: $env_name
 WAD_ENV_NAME=$env_name
 WAD_ENV_INDEX=$env_index
 EOF
-    
+
     # Calculate ports from config
     awk -v idx="$env_index" -v inc="$increment" '
         /^ports:/ { in_ports = 1; next }
@@ -179,10 +318,10 @@ load_env_config() {
 generate_compose() {
     local repo_root="$1" env_name="$2" worktree_path="$3"
     local template="$repo_root/$WAD_DIR/$WAD_COMPOSE_TEMPLATE"
-    
+
     # Load port variables
     source "$worktree_path/.wad-env"
-    
+
     # Build sed substitution commands for all WAD_PORT_* variables
     local sed_args=()
     local repo_root_esc worktree_path_esc env_name_esc
@@ -193,31 +332,28 @@ generate_compose() {
     sed_args+=(-e "s|\\\${repo_root}|${repo_root_esc}|g")
     sed_args+=(-e "s|\\\${worktree_path}|${worktree_path_esc}|g")
     sed_args+=(-e "s|\\\${env_name}|${env_name_esc}|g")
-    
+
     # Add all WAD_PORT_* variables
     while IFS='=' read -r key value; do
         [[ "$key" == WAD_PORT_* ]] && sed_args+=(-e "s|\\\${${key}}|$(escape_sed_replacement "$value")|g")
     done < "$worktree_path/.wad-env"
-    
+
     # Expand ~ to $HOME for paths like ~/Downloads
     sed_args+=(-e "s|~/|${HOME}/|g")
-    
+
     # Add header and process template
     echo "# Generated by wad v${WAD_VERSION} for environment: ${env_name}"
     sed "${sed_args[@]}" "$template"
 }
 
-
-
 # =============================================================================
-# Coding agent helpers (tmux session inside devcontainer)
+# Devcontainer + agent (tmux) helpers
 # =============================================================================
 
 get_agent_config() {
     local repo_root="$1" key="$2" default="$3"
     get_config "$repo_root" "agent.${key}" "$default"
 }
-
 
 is_env_running() {
     local worktree_path="$1" env_name="$2"
@@ -295,28 +431,12 @@ list_service_logs() {
     ' "$config_file" | sed '/^$/d' | sort -u
 }
 
-cmd_agent_start() {
-    local env_name="$1"
-    local prompt="$2"
-    [[ -z "$env_name" ]] && die "Usage: wad agent start <env> \"<prompt>\""
-    [[ -z "$prompt" ]] && die "Usage: wad agent start <env> \"<prompt>\""
+start_goose_task() {
+    local repo_root="$1" worktree_path="$2" env_name="$3" prompt="$4"
 
-    local repo_root=$(check_wad_init)
-    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
-    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
-
-    # Do not auto-start; fail gracefully.
-    require_env_running "$worktree_path" "$env_name" || exit 1
-
-    local agent_cmd session_name env_file
-    agent_cmd="goose"
+    local session_name env_file
     session_name=$(get_agent_config "$repo_root" "session_name" "wad-agent")
     env_file=$(get_agent_config "$repo_root" "env_file" ".wad/agent.env")
-
-    local agent_type
-    agent_type=$(get_agent_config "$repo_root" "type" "")
-    [[ -z "$agent_type" ]] && die "Missing agent.type in .wad/config.yml"
-    [[ "$agent_type" != "goose" ]] && die "Unsupported agent.type: $agent_type (only goose supported)"
 
     ensure_tmux_in_container "$worktree_path" "$env_name"
 
@@ -325,98 +445,35 @@ cmd_agent_start() {
 
     docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T \
       -e WAD_AGENT_SESSION="$session_name" \
-      -e WAD_PROMPT="$prompt" \
-      -e WAD_AGENT_CMD="$agent_cmd" \
       -e WAD_AGENT_ENV_FILE="$env_file" \
       -e WAD_LOGS="$logs" \
+      -e WAD_PROMPT="$prompt" \
       devcontainer bash -lc '
         set -e
+
         session="$WAD_AGENT_SESSION"
         agent_target="$session:agent"
 
-        if tmux has-session -t "$session" 2>/dev/null; then
-          # Send prompt to the agent window (not whichever window is currently active)
-          tmux send-keys -t "$agent_target" -- "$WAD_PROMPT" Enter
-          exit 0
-        fi
+        # Persist prompt to file so tmux shells can read it (they won\x27t inherit docker exec env).
+        printf "%s" "$WAD_PROMPT" > /tmp/wad-prompt
 
-        # Create a named agent window so attach can land here by default.
-        tmux new-session -d -s "$session" -n agent -c /workspace bash
+        if ! tmux has-session -t "$session" 2>/dev/null; then
+          tmux new-session -d -s "$session" -n agent -c /workspace bash
 
-        # Create logs window detached so it does not become the default view.
-        if [ -n "$WAD_LOGS" ]; then
-          tmux new-window -d -t "$session" -n logs "bash -lc \"tail -n 200 -F $WAD_LOGS\""
+          # A dedicated logs window (goose + service logs)
+          tmux new-window -d -t "$session" -n logs "bash -lc \"touch /tmp/goose.log; tail -n 200 -F /tmp/goose.log $WAD_LOGS\""
         fi
 
         tmux send-keys -t "$agent_target" -- "cd /workspace" Enter
         tmux send-keys -t "$agent_target" -- "[[ -f /workspace/.wad/.env ]] && set -a && source /workspace/.wad/.env && set +a" Enter
         tmux send-keys -t "$agent_target" -- "[[ -f /workspace/$WAD_AGENT_ENV_FILE ]] && set -a && source /workspace/$WAD_AGENT_ENV_FILE && set +a" Enter
-        tmux send-keys -t "$agent_target" -- "$WAD_AGENT_CMD" Enter
-        tmux send-keys -t "$agent_target" -- "$WAD_PROMPT" Enter
+
+        # Run goose via the WAD unattended task recipe and log output.
+        # Pass the prompt via a file param so we do not fight shell quoting.
+        tmux send-keys -t "$agent_target" -- "(goose run --no-session --recipe /workspace/.wad/goose/recipes/wad_task.yaml --params task=/tmp/wad-prompt 2>&1 | tee -a /tmp/goose.log)" Enter
       '
 
-    log_success "Agent session started (tmux: $session_name)"
-    log_info "Attach: wad agent attach $env_name"
-}
-
-cmd_agent_attach() {
-    local env_name="$1"
-    [[ -z "$env_name" ]] && die "Usage: wad agent attach <env>"
-
-    local repo_root=$(check_wad_init)
-    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
-    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
-
-    require_env_running "$worktree_path" "$env_name" || exit 1
-
-    local session_name
-    session_name=$(get_agent_config "$repo_root" "session_name" "wad-agent")
-
-    if ! docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T devcontainer bash -lc "command -v tmux >/dev/null 2>&1 && tmux has-session -t '$session_name' 2>/dev/null"; then
-        die "Agent session is not running. Start it with: wad agent start $env_name \"<prompt>\""
-    fi
-
-    docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec devcontainer tmux attach -t "${session_name}:agent"
-}
-
-cmd_agent_stop() {
-    local env_name="$1"
-    [[ -z "$env_name" ]] && die "Usage: wad agent stop <env>"
-
-    local repo_root=$(check_wad_init)
-    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
-    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
-
-    require_env_running "$worktree_path" "$env_name" || exit 1
-
-    local session_name
-    session_name=$(get_agent_config "$repo_root" "session_name" "wad-agent")
-
-    docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T devcontainer tmux kill-session -t "$session_name" 2>/dev/null || true
-    log_success "Agent session stopped"
-}
-
-cmd_agent_status() {
-    local env_name="$1"
-    [[ -z "$env_name" ]] && die "Usage: wad agent status <env>"
-
-    local repo_root=$(check_wad_init)
-    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
-    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
-
-    if ! is_env_running "$worktree_path" "$env_name"; then
-        echo "stopped"
-        return 0
-    fi
-
-    local session_name
-    session_name=$(get_agent_config "$repo_root" "session_name" "wad-agent")
-
-    if docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T devcontainer bash -lc "command -v tmux >/dev/null 2>&1 && tmux has-session -t '$session_name' 2>/dev/null"; then
-        echo "running"
-    else
-        echo "stopped"
-    fi
+    log_success "Goose started in background (tmux session: $session_name)"
 }
 
 # =============================================================================
@@ -439,20 +496,12 @@ cmd_init() {
 
     log_header "Initializing WAD"
 
-    # Coding agent selection (for now only: goose)
-    # For --upgrade/--force we skip prompting and use goose.
-    local agent_type="goose"
-    if [[ "$mode" != "--upgrade" && "$mode" != "--force" && -t 0 ]]; then
-        read -p "Select coding agent type [goose]: " agent_type
-        agent_type=${agent_type:-goose}
-    fi
-    [[ "$agent_type" != "goose" ]] && die "Unsupported agent type: $agent_type (only goose supported)"
-
     mkdir -p "$repo_root/$WAD_DIR"
     mkdir -p "$repo_root/$WAD_WORKTREES_DIR"
 
     # Upgrade behavior: for --upgrade we backup generated templates before overwriting
-    local ts="$(date +%Y%m%d%H%M%S)"
+    local ts
+    ts="$(date +%Y%m%d%H%M%S)"
     local backup_dir="$repo_root/$WAD_DIR/.backup-$ts"
 
     backup_if_exists() {
@@ -466,7 +515,9 @@ cmd_init() {
         backup_if_exists "$repo_root/$WAD_DIR/$WAD_CONFIG_FILE"
         backup_if_exists "$repo_root/$WAD_DIR/$WAD_COMPOSE_TEMPLATE"
         backup_if_exists "$repo_root/$WAD_DIR/.gitignore"
-    fi    # .gitignore for secrets
+    fi
+
+    # .gitignore for secrets
     if [[ "$mode" == "--upgrade" && -f "$repo_root/$WAD_DIR/.gitignore" ]]; then
         add_ignore() {
             local line="$1"
@@ -475,14 +526,16 @@ cmd_init() {
         add_ignore '.env'
         add_ignore 'agent.env'
         add_ignore 'goose/'
+        add_ignore 'namegen/'
     else
         cat > "$repo_root/$WAD_DIR/.gitignore" << 'EOF'
 .env
 agent.env
 goose/
+namegen/
 EOF
     fi
-    
+
     # Empty env file
     if [[ "$mode" == "--force" || ! -f "$repo_root/$WAD_DIR/.env" ]]; then
         cat > "$repo_root/$WAD_DIR/.env" << 'EOF'
@@ -492,30 +545,37 @@ EOF
 EOF
     fi
 
-    # Coding agent environment file (gitignored by default; remove from .wad/.gitignore to commit it)
+    # Agent environment file (gitignored by default)
     if [[ "$mode" == "--force" || ! -f "$repo_root/$WAD_DIR/agent.env" ]]; then
         cat > "$repo_root/$WAD_DIR/agent.env" << 'EOF'
-# Environment variables for your coding agent (sourced when starting the agent session)
+# Environment variables for goose (sourced inside the devcontainer before running goose)
 # Examples (uncomment and edit):
 # GOOSE_PROVIDER=...
 # GOOSE_MODEL=...
 EOF
     fi
-    
+
     # Minimal config
     cat > "$repo_root/$WAD_DIR/$WAD_CONFIG_FILE" << 'EOF'
 # WAD Configuration
 # Docker compose template: .wad/compose.yml
 # Environment variables:   .wad/.env (gitignored)
 
-version: 2
+version: 3
+
+# Environment name generator (used by: wad new "<prompt>")
+namegen:
+  # Local image built by `wad init` (rebuilt automatically if missing)
+  image: wad-namegen:local
+  # Target max time for name sampling; if exceeded, wad will fall back to local slugification
+  timeout_seconds: 2
 
 ports:
   increment: 10
   exposed:
     APP: 8080
 
-# Services started with `wad run` (inside devcontainer)
+# Services started automatically by `wad new` (and manually by `wad run`)
 services:
   app:
     name: app
@@ -523,16 +583,14 @@ services:
     command: echo "Configure your app command"
     log: /tmp/app.log
 
-
-# Coding agent (runs inside the devcontainer)
+# Goose settings (runs inside the devcontainer)
 agent:
-  # For now, the only supported agent type is `goose`.
   type: goose
 
-  # Extra env vars for the agent (gitignored by default)
+  # Extra env vars for goose (gitignored by default)
   env_file: .wad/agent.env
 
-  # tmux session name used for start/attach/stop
+  # tmux session name used for attach
   session_name: wad-agent
 
   goose:
@@ -541,9 +599,7 @@ agent:
     config_dir: .wad/goose
 EOF
 
-
     # Goose global config (gitignored by default).
-    # This will be copied into /root/.config/goose inside the devcontainer at container start.
     mkdir -p "$repo_root/$WAD_DIR/goose"
     if [[ "$mode" == "--force" || ! -f "$repo_root/$WAD_DIR/goose/config.yaml" ]]; then
         cat > "$repo_root/$WAD_DIR/goose/config.yaml" << 'EOF'
@@ -557,20 +613,6 @@ extensions:
     description: Code editing and shell access
     display_name: Developer Tools
     timeout: 300
-    bundled: true
-    available_tools: []
-  code_execution:
-    enabled: false
-    type: platform
-    name: code_execution
-    description: Execute JavaScript code in a sandboxed environment
-    bundled: true
-    available_tools: []
-  chatrecall:
-    enabled: false
-    type: platform
-    name: chatrecall
-    description: Search past conversations and load session summaries for contextual memory
     bundled: true
     available_tools: []
   todo:
@@ -587,46 +629,12 @@ extensions:
     description: Enable extension management tools for discovering, enabling, and disabling extensions
     bundled: true
     available_tools: []
-  skills:
-    enabled: false
-    type: platform
-    name: skills
-    description: Load and use skills from relevant directories
-    bundled: true
-    available_tools: []
-  computercontroller:
-    enabled: false
-    type: builtin
-    name: computercontroller
-    description: General computer control tools that don't require you to be a developer or engineer.
-    display_name: Computer Controller
-    timeout: 300
-    bundled: true
-    available_tools: []
-  autovisualiser:
-    enabled: false
-    type: builtin
-    name: autovisualiser
-    description: Data visualisation and UI generation tools
-    display_name: Auto Visualiser
-    timeout: 300
-    bundled: true
-    available_tools: []
   memory:
     enabled: true
     type: builtin
     name: memory
     description: Teach goose your preferences as you go.
     display_name: Memory
-    timeout: 300
-    bundled: true
-    available_tools: []
-  tutorial:
-    enabled: false
-    type: builtin
-    name: tutorial
-    description: Access interactive tutorials and guides
-    display_name: Tutorial
     timeout: 300
     bundled: true
     available_tools: []
@@ -638,7 +646,106 @@ GOOSE_CLI_MIN_PRIORITY: 0.2
 GOOSE_MAX_TURNS: 1000
 EOF
     fi
-    
+
+
+    # WAD unattended task recipe (used by wad new)
+    # Stored under the goose config dir so it is available in-container at:
+    #   /workspace/.wad/goose/recipes/wad_task.yaml
+    mkdir -p "$repo_root/$WAD_DIR/goose/recipes"
+    if [[ "$mode" == "--force" || ! -f "$repo_root/$WAD_DIR/goose/recipes/wad_task.yaml" ]]; then
+        cat > "$repo_root/$WAD_DIR/goose/recipes/wad_task.yaml" << 'EOF'
+version: "1.0.0"
+title: "WAD Unattended Task"
+description: "Run a single unattended task in a repo. No human interaction expected."
+
+parameters:
+  - key: task
+    input_type: file
+    requirement: required
+    description: "Path to a file containing the user-provided task prompt"
+
+prompt: |
+  You are running as an UNATTENDED coding agent inside a devcontainer.
+  You will NOT receive additional user messages in the happy path.
+
+  Rules:
+  - Do NOT ask the user questions.
+  - Do NOT wait for user input.
+  - If information is missing, make a reasonable assumption and record it.
+  - If you are blocked (e.g., missing credentials, unclear requirements, failing setup you cannot fix),
+    stop and produce a BLOCKED result with what you need.
+  - Prefer making small, safe changes; avoid destructive actions.
+  - When possible, run quick checks (format/lint/test) to validate changes.
+  - If you change files, keep edits minimal and coherent.
+
+  Execution style:
+  1) Restate the task in your own words.
+  2) Make a short plan.
+  3) Execute the plan.
+  4) Validate (tests/build/etc) if feasible.
+  5) Produce a final structured result (see response schema).
+
+  Task:
+  {{ task }}
+
+response:
+  json_schema:
+    type: object
+    additionalProperties: false
+    properties:
+      status:
+        type: string
+        description: "Overall result status"
+        enum: ["completed", "blocked"]
+      summary:
+        type: string
+        description: "Short human-readable summary of what happened"
+      assumptions:
+        type: array
+        items: { type: string }
+        description: "Assumptions you made due to missing context"
+      changes_made:
+        type: array
+        items: { type: string }
+        description: "High-level description of changes"
+      files_modified:
+        type: array
+        items: { type: string }
+        description: "Paths of files modified/created"
+      commands_run:
+        type: array
+        items: { type: string }
+        description: "Commands executed (tests, formatting, etc.)"
+      validation:
+        type: string
+        description: "What validation was run and what the outcome was"
+      blocking_reasons:
+        type: array
+        items: { type: string }
+        description: "Concrete reasons why work could not be completed"
+      blocking_questions:
+        type: array
+        items: { type: string }
+        description: "Questions that must be answered to proceed (only if blocked)"
+      next_steps:
+        type: array
+        items: { type: string }
+        description: "Suggested next steps for a human or a follow-up agent run"
+    required:
+      - status
+      - summary
+      - assumptions
+      - changes_made
+      - files_modified
+      - commands_run
+      - validation
+      - blocking_reasons
+      - blocking_questions
+      - next_steps
+EOF
+    fi
+
+
     # Sample compose template
     cat > "$repo_root/$WAD_DIR/$WAD_COMPOSE_TEMPLATE" << 'EOF'
 # WAD Docker Compose Template
@@ -660,71 +767,108 @@ services:
     stdin_open: true
     tty: true
     command: >
-      bash -lc 'set -e;         if command -v apt-get >/dev/null 2>&1; then           need_pkgs="";           command -v curl >/dev/null 2>&1 || need_pkgs=1;           command -v tmux >/dev/null 2>&1 || need_pkgs=1;           ls /usr/lib/*-linux-gnu/libxcb.so.1 >/dev/null 2>&1 || need_pkgs=1;           if [ -n "$$need_pkgs" ]; then             export DEBIAN_FRONTEND=noninteractive;             apt-get update -qq >/dev/null;             apt-get install -y -qq curl ca-certificates bzip2 tar libxcb1 tmux >/dev/null;             rm -rf /var/lib/apt/lists/*;           fi;         fi;         if ! command -v goose >/dev/null 2>&1; then           arch=$$(uname -m);           case "$$arch" in             x86_64) goose_url="https://github.com/block/goose/releases/latest/download/goose-x86_64-unknown-linux-gnu.tar.bz2" ;;             aarch64|arm64) goose_url="https://github.com/block/goose/releases/latest/download/goose-aarch64-unknown-linux-gnu.tar.bz2" ;;             *) echo "[wad] Unsupported arch for goose: $$arch" >&2; exit 1 ;;           esac;           tmp=$$(mktemp -d);           curl -fsSL "$$goose_url" -o "$$tmp/goose.tar.bz2";           tar -xjf "$$tmp/goose.tar.bz2" -C "$$tmp";           install -m 0755 "$$tmp/goose" /usr/local/bin/goose;           rm -rf "$$tmp";         fi;         if [ -d /workspace/.wad/goose ]; then           mkdir -p /root/.config/goose;           cp -a /workspace/.wad/goose/. /root/.config/goose/ 2>/dev/null || true;         fi;         touch /tmp/wad-ready;         echo "[wad] Ready.";         exec sleep infinity'
+      bash -lc 'set -e;
+        if command -v apt-get >/dev/null 2>&1; then
+          need_pkgs="";
+          command -v curl >/dev/null 2>&1 || need_pkgs=1;
+          command -v tmux >/dev/null 2>&1 || need_pkgs=1;
+          if [ -n "$$need_pkgs" ]; then
+            export DEBIAN_FRONTEND=noninteractive;
+            apt-get update -qq >/dev/null;
+            apt-get install -y -qq curl ca-certificates bzip2 tar tmux >/dev/null;
+            rm -rf /var/lib/apt/lists/*;
+          fi;
+        fi;
+
+        if ! command -v goose >/dev/null 2>&1; then
+          arch=$(uname -m);
+          case "$$arch" in
+            x86_64) goose_url="https://github.com/block/goose/releases/latest/download/goose-x86_64-unknown-linux-gnu.tar.bz2" ;;
+            aarch64|arm64) goose_url="https://github.com/block/goose/releases/latest/download/goose-aarch64-unknown-linux-gnu.tar.bz2" ;;
+            *) echo "[wad] Unsupported arch for goose: $$arch" >&2; exit 1 ;;
+          esac;
+          tmp=$(mktemp -d);
+          curl -fsSL "$$goose_url" -o "$$tmp/goose.tar.bz2";
+          tar -xjf "$$tmp/goose.tar.bz2" -C "$$tmp";
+          install -m 0755 "$$tmp/goose" /usr/local/bin/goose;
+          rm -rf "$$tmp";
+        fi;
+
+        if [ -d /workspace/.wad/goose ]; then
+          mkdir -p /root/.config/goose;
+          cp -a /workspace/.wad/goose/. /root/.config/goose/ 2>/dev/null || true;
+        fi;
+
+        touch /tmp/wad-ready;
+        echo "[wad] Ready.";
+        exec sleep infinity'
 
 networks:
   default:
     name: wad-${env_name}
 EOF
-    
+
     log_success "Initialized WAD in $repo_root"
     log_info "Edit $WAD_DIR/$WAD_COMPOSE_TEMPLATE to configure your environment"
     log_info "Edit $WAD_DIR/$WAD_CONFIG_FILE for ports and services"
+
+    # Build the name generator image now (avoids first-run delay during wad new).
+    build_namegen_image "$repo_root"
 }
 
 cmd_new() {
-    local env_name="$1" base_branch="${2:-}"
-    [[ -z "$env_name" ]] && die "Usage: wad new <name> [base-branch]"
-    
-    local repo_root=$(check_wad_init)
-    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
-    
-    [[ -d "$worktree_path" ]] && die "Environment '$env_name' already exists"
-    
-    log_header "Creating environment: $env_name"
-    
-    # Base branch selection precedence:
-    # 1) explicit CLI arg
-    # 2) config: worktrees.default_base
-    # 3) current branch
-    # 4) main/master if present
-    # 5) HEAD
-    if [[ -z "$base_branch" ]]; then
-        base_branch=$(get_config "$repo_root" "worktrees.default_base" "")
-        [[ -z "$base_branch" ]] && base_branch=$(git -C "$repo_root" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+    local prompt="$*"
+    [[ -z "$prompt" ]] && die "Usage: wad new \"<prompt>\""
 
-        if [[ -z "$base_branch" ]]; then
-            if git -C "$repo_root" show-ref --verify --quiet refs/heads/main; then
-                base_branch="main"
-            elif git -C "$repo_root" show-ref --verify --quiet refs/heads/master; then
-                base_branch="master"
-            else
-                base_branch="HEAD"
-            fi
+    local repo_root
+    repo_root=$(check_wad_init)
+
+    local suggested base_slug env_name worktree_path
+    suggested=$(sample_env_name_from_prompt "$repo_root" "$prompt")
+    base_slug=$(slugify "$suggested")
+    env_name=$(ensure_unique_env_name "$repo_root" "$base_slug")
+    worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
+
+    log_header "Creating environment: $env_name"
+
+    # Base branch selection precedence:
+    # 1) config: worktrees.default_base
+    # 2) current branch
+    # 3) main/master if present
+    # 4) HEAD
+    local base_branch
+    base_branch=$(get_config "$repo_root" "worktrees.default_base" "")
+    [[ -z "$base_branch" ]] && base_branch=$(git -C "$repo_root" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+
+    if [[ -z "$base_branch" ]]; then
+        if git -C "$repo_root" show-ref --verify --quiet refs/heads/main; then
+            base_branch="main"
+        elif git -C "$repo_root" show-ref --verify --quiet refs/heads/master; then
+            base_branch="master"
+        else
+            base_branch="HEAD"
         fi
     fi
-    
-    local env_index=$(get_next_env_index "$repo_root")
-    
-    log_info "Creating git worktree..."
+
+    local env_index
+    env_index=$(get_next_env_index "$repo_root")
+
+    log_info "Creating git worktree (branch: wad/$env_name from $base_branch)..."
     git -C "$repo_root" worktree add -b "wad/$env_name" "$worktree_path" "$base_branch"
-    
+
     log_info "Generating environment config..."
     generate_env_file "$env_name" "$env_index" "$repo_root" > "$worktree_path/.wad-env"
-    
+
     log_info "Generating docker-compose..."
     generate_compose "$repo_root" "$env_name" "$worktree_path" > "$worktree_path/.wad-compose.yml"
-    
-    # Load env for port display
-    source "$worktree_path/.wad-env"
-    
+
     log_info "Starting containers..."
     docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" up -d
-    
-    log_info "Waiting for devcontainer..."
-    local max_wait=120 waited=0
+
+    log_info "Waiting for devcontainer readiness marker (/tmp/wad-ready)..."
+    local max_wait=180 waited=0
     while [[ $waited -lt $max_wait ]]; do
-        if docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T devcontainer true 2>/dev/null; then
+        if docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T devcontainer bash -lc "test -f /tmp/wad-ready" 2>/dev/null; then
             break
         fi
         sleep 2
@@ -732,78 +876,117 @@ cmd_new() {
         echo -n "."
     done
     echo ""
-    
-    [[ $waited -ge $max_wait ]] && log_warn "Devcontainer may not be fully ready"
-    
+    [[ $waited -ge $max_wait ]] && log_warn "Devcontainer may not be fully ready (timed out waiting for /tmp/wad-ready)"
+
+    # Start services automatically
+    cmd_run "$env_name"
+
+    # Start goose task in background (tmux)
+    start_goose_task "$repo_root" "$worktree_path" "$env_name" "$prompt"
+
     log_success "Environment '$env_name' created"
+    log_info "Prompt: $prompt"
+
     log_info "Ports:"
     (grep "^WAD_PORT_" "$worktree_path/.wad-env" 2>/dev/null || echo "(none)") | sed "s/^/  /"
-    log_info "Commands:"
-    echo "  wad shell $env_name   # Enter container"
-    echo "  wad run $env_name     # Start services"
+
+    log_info "Next:"
+    echo "  wad attach $env_name        # Watch goose + logs (tmux; requires a real TTY)"
+    echo "  wad logs $env_name goose    # Tail goose log (/tmp/goose.log)"
+}
+
+cmd_attach() {
+    local env_name="$1"
+    [[ -z "$env_name" ]] && die "Usage: wad attach <env>"
+
+    local repo_root
+    repo_root=$(check_wad_init)
+
+    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
+    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
+
+    require_env_running "$worktree_path" "$env_name" || exit 1
+
+    local session_name
+    session_name=$(get_agent_config "$repo_root" "session_name" "wad-agent")
+
+    if ! docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T devcontainer bash -lc "command -v tmux >/dev/null 2>&1 && tmux has-session -t '$session_name' 2>/dev/null"; then
+        die "No tmux session found in container. If you just ran 'wad new', give it a moment; otherwise re-run: wad new \"<prompt>\""
+    fi
+
+    docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec devcontainer tmux attach -t "${session_name}:agent"
 }
 
 cmd_ls() {
-    local repo_root=$(check_wad_init)
-    
+    local repo_root
+    repo_root=$(check_wad_init)
+
     echo -e "${BOLD}WAD Environments${NC}"
     echo ""
-    
+
     local found=0
     for env_dir in "$repo_root/$WAD_WORKTREES_DIR"/*/; do
         [[ -d "$env_dir" ]] || continue
         found=1
-        
-        local env_name=$(basename "$env_dir")
+
+        local env_name
+        env_name=$(basename "$env_dir")
         local env_file="$env_dir/.wad-env"
         local compose_file="$env_dir/.wad-compose.yml"
-        
+
         local ports=""
         if [[ -f "$env_file" ]]; then
             ports=$(grep '^WAD_PORT_' "$env_file" 2>/dev/null | sed 's/^WAD_PORT_//' | tr '\n' ' ' | sed 's/[[:space:]]*$//')
         fi
-        
+
         local status="stopped"
         if [[ -f "$compose_file" ]]; then
-            local running=$(docker compose -f "$compose_file" -p "wad-$env_name" ps -q 2>/dev/null | wc -l)
+            local running
+            running=$(docker compose -f "$compose_file" -p "wad-$env_name" ps -q 2>/dev/null | wc -l)
             [[ "$running" -gt 0 ]] && status="${GREEN}running${NC}"
         fi
-        
-        local branch=$(git -C "$env_dir" branch --show-current 2>/dev/null || echo "?")
-        
+
+        local branch
+        branch=$(git -C "$env_dir" branch --show-current 2>/dev/null || echo "?")
+
         printf "  ${BOLD}%-20s${NC} %s  (%s)\n" "$env_name" "${ports:+ports:$ports }$status" "$branch"
     done
-    
-    [[ $found -eq 0 ]] && echo "  No environments found. Create one with: wad new <name>"
+
+    [[ $found -eq 0 ]] && echo "  No environments found. Create one with: wad new \"<prompt>\""
 }
 
 cmd_shell() {
     local env_name="$1"
-    [[ -z "$env_name" ]] && die "Usage: wad shell <name>"
-    
-    local repo_root=$(check_wad_init)
+    [[ -z "$env_name" ]] && die "Usage: wad shell <env>"
+
+    local repo_root
+    repo_root=$(check_wad_init)
+
     local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
     [[ -d "$worktree_path" ]] || die "Not found: $env_name"
-    
+
     docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec devcontainer bash
 }
 
 cmd_run() {
     local env_name="$1"
-    [[ -z "$env_name" ]] && die "Usage: wad run <name>"
-    
-    local repo_root=$(check_wad_init)
+    [[ -z "$env_name" ]] && die "Usage: wad run <env>"
+
+    local repo_root
+    repo_root=$(check_wad_init)
+
     local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
     [[ -d "$worktree_path" ]] || die "Not found: $env_name"
-    
+
     local config="$repo_root/$WAD_DIR/$WAD_CONFIG_FILE"
-    
+
     # Build command to source env and start services
     local cmd="cd /workspace && "
     cmd+="[[ -f .wad/.env ]] && set -a && source .wad/.env && set +a; "
-    
+
     # Parse services from config
-    local services=$(awk '
+    local services
+    services=$(awk '
         /^services:/ { in_svc = 1; next }
         in_svc && /^[a-zA-Z]/ && !/^[[:space:]]/ { exit }
         in_svc && /^[[:space:]]{2}[a-zA-Z_-]+:/ {
@@ -811,50 +994,52 @@ cmd_run() {
             print name
         }
     ' "$config")
-    
+
     for svc in $services; do
-        local svc_workdir=$(awk -v svc="$svc" '
+        local svc_workdir svc_cmd svc_log svc_env
+
+        svc_workdir=$(awk -v svc="$svc" '
             /^services:/ { in_svc = 1; next }
-            in_svc && /^[[:space:]]{2}[a-zA-Z_-]+:/ { 
+            in_svc && /^[[:space:]]{2}[a-zA-Z_-]+:/ {
                 current = $1; gsub(/:/, "", current)
                 in_current = (current == svc)
             }
-            in_current && /workdir:/ { 
-                gsub(/.*workdir:[[:space:]]*/, ""); 
+            in_current && /workdir:/ {
+                gsub(/.*workdir:[[:space:]]*/, "");
                 gsub(/[[:space:]]*$/, "");
-                print; exit 
+                print; exit
             }
         ' "$config")
-        
-        local svc_cmd=$(awk -v svc="$svc" '
+
+        svc_cmd=$(awk -v svc="$svc" '
             /^services:/ { in_svc = 1; next }
-            in_svc && /^[[:space:]]{2}[a-zA-Z_-]+:/ { 
+            in_svc && /^[[:space:]]{2}[a-zA-Z_-]+:/ {
                 current = $1; gsub(/:/, "", current)
                 in_current = (current == svc)
             }
-            in_current && /command:/ { 
-                gsub(/.*command:[[:space:]]*/, ""); 
+            in_current && /command:/ {
+                gsub(/.*command:[[:space:]]*/, "");
                 gsub(/[[:space:]]*$/, "");
-                print; exit 
+                print; exit
             }
         ' "$config")
-        
-        local svc_log=$(awk -v svc="$svc" '
+
+        svc_log=$(awk -v svc="$svc" '
             /^services:/ { in_svc = 1; next }
-            in_svc && /^[[:space:]]{2}[a-zA-Z_-]+:/ { 
+            in_svc && /^[[:space:]]{2}[a-zA-Z_-]+:/ {
                 current = $1; gsub(/:/, "", current)
                 in_current = (current == svc)
             }
-            in_current && /log:/ { 
-                gsub(/.*log:[[:space:]]*/, ""); 
+            in_current && /log:/ {
+                gsub(/.*log:[[:space:]]*/, "");
                 gsub(/[[:space:]]*$/, "");
-                print; exit 
+                print; exit
             }
         ' "$config")
-        
-        local svc_env=$(awk -v svc="$svc" '
+
+        svc_env=$(awk -v svc="$svc" '
             /^services:/ { in_svc = 1; next }
-            in_svc && /^[[:space:]]{2}[a-zA-Z_-]+:/ { 
+            in_svc && /^[[:space:]]{2}[a-zA-Z_-]+:/ {
                 current = $1; gsub(/:/, "", current)
                 in_current = (current == svc)
                 in_env = 0
@@ -863,12 +1048,13 @@ cmd_run() {
             in_current && in_env && /^[[:space:]]{6}[A-Z_]+:/ {
                 key = $1; gsub(/:/, "", key)
                 val = $0; gsub(/.*:[[:space:]]*/, "", val)
-                gsub(/^["'"'"']|["'"'"']$/, "", val)
+                gsub(/^\"|\"$/, "", val)
+                gsub(/^\x27|\x27$/, "", val)
                 print "export " key "=\"" val "\"; "
             }
             in_current && in_env && /^[[:space:]]{4}[a-z]/ { in_env = 0 }
         ' "$config")
-        
+
         if [[ -n "$svc_cmd" ]]; then
             log_info "Starting $svc..."
             [[ -z "$svc_log" ]] && svc_log="/tmp/${svc}.log"
@@ -876,56 +1062,65 @@ cmd_run() {
             cmd+="$svc_env cd ${svc_workdir:-/workspace} && $svc_cmd$log_redirect & "
         fi
     done
-    
+
     cmd+="echo 'Services started'; sleep infinity"
-    
+
     docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -d devcontainer bash -c "$cmd"
-    
+
     log_success "Services started"
     log_info "View logs: wad logs $env_name <service>"
 }
 
-
 cmd_logs() {
     local env_name="$1" service="${2:-}"
-    [[ -z "$env_name" ]] && die "Usage: wad logs <name> [service]"
-    
-    local repo_root=$(check_wad_init)
+    [[ -z "$env_name" ]] && die "Usage: wad logs <env> [service]"
+
+    local repo_root
+    repo_root=$(check_wad_init)
+
     local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
     [[ -d "$worktree_path" ]] || die "Not found: $env_name"
-    
+
     if [[ -z "$service" ]]; then
         docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" logs -f
-    else
-        local config="$repo_root/$WAD_DIR/$WAD_CONFIG_FILE"
-        local log_file=$(awk -v svc="$service" '
-            /^services:/ { in_svc = 1; next }
-            in_svc && /^[[:space:]]{2}[a-zA-Z_-]+:/ { 
-                current = $1; gsub(/:/, "", current)
-                in_current = (current == svc)
-            }
-            in_current && /log:/ { 
-                gsub(/.*log:[[:space:]]*/, ""); 
-                gsub(/[[:space:]]*$/, "");
-                print; exit 
-            }
-        ' "$config")
-        
-        if [[ -z "$log_file" ]]; then
-            log_file="/tmp/${service}.log"
-        fi
-        docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec devcontainer tail -f "$log_file"
+        return 0
     fi
+
+    if [[ "$service" == "goose" ]]; then
+        docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec devcontainer tail -n 200 -F /tmp/goose.log
+        return 0
+    fi
+
+    local config="$repo_root/$WAD_DIR/$WAD_CONFIG_FILE"
+    local log_file
+    log_file=$(awk -v svc="$service" '
+        /^services:/ { in_svc = 1; next }
+        in_svc && /^[[:space:]]{2}[a-zA-Z_-]+:/ {
+            current = $1; gsub(/:/, "", current)
+            in_current = (current == svc)
+        }
+        in_current && /log:/ {
+            gsub(/.*log:[[:space:]]*/, "");
+            gsub(/[[:space:]]*$/, "");
+            print; exit
+        }
+    ' "$config")
+
+    [[ -z "$log_file" ]] && log_file="/tmp/${service}.log"
+
+    docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec devcontainer tail -n 200 -F "$log_file"
 }
 
 cmd_start() {
     local env_name="$1"
-    [[ -z "$env_name" ]] && die "Usage: wad start <name>"
-    
-    local repo_root=$(check_wad_init)
+    [[ -z "$env_name" ]] && die "Usage: wad start <env>"
+
+    local repo_root
+    repo_root=$(check_wad_init)
+
     local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
     [[ -d "$worktree_path" ]] || die "Not found: $env_name"
-    
+
     load_env_config "$repo_root" "$env_name"
     docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" up -d
     log_success "Started"
@@ -933,37 +1128,39 @@ cmd_start() {
 
 cmd_stop() {
     local env_name="$1"
-    [[ -z "$env_name" ]] && die "Usage: wad stop <name>"
-    
-    local repo_root=$(check_wad_init)
+    [[ -z "$env_name" ]] && die "Usage: wad stop <env>"
+
+    local repo_root
+    repo_root=$(check_wad_init)
+
     local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
     [[ -d "$worktree_path" ]] || die "Not found: $env_name"
-    
+
     docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" stop
     log_success "Stopped"
 }
 
 cmd_rm() {
     local env_name="$1" force="${2:-}"
-    [[ -z "$env_name" ]] && die "Usage: wad rm <name> [--force]"
-    
-    local repo_root=$(check_wad_init)
+    [[ -z "$env_name" ]] && die "Usage: wad rm <env> [--force]"
+
+    local repo_root
+    repo_root=$(check_wad_init)
+
     local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
     [[ -d "$worktree_path" ]] || die "Not found: $env_name"
-    
+
     if [[ "$force" != "--force" ]]; then
         read -p "Remove '$env_name'? [y/N] " -n 1 -r; echo
         [[ $REPLY =~ ^[Yy]$ ]] || exit 0
     fi
-    
+
     log_info "Removing containers..."
     docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" down -v 2>/dev/null || true
 
     log_info "Removing worktree..."
     if ! git -C "$repo_root" worktree remove "$worktree_path" --force 2>/dev/null; then
         log_warn "Worktree removal failed; deleting uid=0 (root-owned) paths and retrying..."
-        # Some containers create files as uid 0 on bind-mounted volumes.
-        # That can prevent deletion on the host. Remove only uid-0 paths.
         docker run --rm -v "$worktree_path:/workspace" alpine:3.19 sh -c '
           set -e
           find /workspace -mindepth 1 -uid 0 -exec rm -rf -- {} + 2>/dev/null || true
@@ -973,7 +1170,7 @@ cmd_rm() {
     fi
 
     git -C "$repo_root" branch -D "wad/$env_name" 2>/dev/null || true
-    
+
     log_success "Removed"
 }
 
@@ -981,40 +1178,30 @@ cmd_help() {
     cat << EOF
 ${BOLD}wad${NC} v$WAD_VERSION - Worktree Agent Devcontainers
 
+${BOLD}PRIMARY WORKFLOW${NC}
+  wad init
+  # edit .wad/compose.yml and .wad/config.yml
+  wad new "<prompt>"      Create env, start containers+services, start goose in background
+  wad attach <env>         Attach to the tmux session to watch progress
+
 ${BOLD}COMMANDS${NC}
-  init              Initialize wad in current repo
-  new <name>        Create new environment
-  ls                List environments
-  
-  start <name>      Start containers
-  stop <name>       Stop containers  
-  rm <name>         Remove environment
-  
-  shell <name>      Enter container shell
-  run <name>        Start services (from config.yml)
-  agent start <env> "<prompt>"  Start agent session and send initial prompt (requires env running)
-  agent attach <env>             Attach (tmux) to running agent session
-  agent stop <env>               Stop agent session
-  agent status <env>             Print running/stopped
-  logs <name> [svc] View logs
+  init                     Initialize wad in current repo (also builds the namegen image)
+  new "<prompt>"            Create a new environment for the prompt
+  attach <env>             Attach to goose tmux session inside the devcontainer
+  ls                       List environments
 
-${BOLD}CONFIGURATION${NC}
-  .wad/compose.yml      Docker compose template (full syntax)
-  .wad/config.yml       WAD settings (ports, services)
-  .wad/.env             Environment variables (gitignored)
+  start <env>              Start containers
+  stop <env>               Stop containers
+  rm <env> [--force]       Remove environment
 
-${BOLD}TEMPLATE VARIABLES${NC}
-  \${repo_root}         Path to main repository
-  \${worktree_path}     Path to worktree directory  
-  \${env_name}          Environment name
-  \${WAD_PORT_*}        Calculated ports from config.yml
+  shell <env>              Enter container shell
+  run <env>                Start services (from config.yml)
+  logs <env> [svc|goose]    View logs (use 'goose' to tail /tmp/goose.log)
 
 ${BOLD}EXAMPLE${NC}
   wad init
-  # Edit .wad/compose.yml (your docker-compose template)
-  # Edit .wad/config.yml (ports, services)
-  wad new feature-x
-  wad run feature-x
+  wad new "add a healthcheck endpoint and tests"
+  wad attach <env>
 EOF
 }
 
@@ -1022,6 +1209,7 @@ EOF
 case "${1:-help}" in
     init)    cmd_init "${@:2}" ;;
     new)     cmd_new "${@:2}" ;;
+    attach)  cmd_attach "${@:2}" ;;
     ls)      cmd_ls ;;
     start)   cmd_start "${@:2}" ;;
     stop)    cmd_stop "${@:2}" ;;
@@ -1029,19 +1217,6 @@ case "${1:-help}" in
     shell)   cmd_shell "${@:2}" ;;
     run)     cmd_run "${@:2}" ;;
     logs)    cmd_logs "${@:2}" ;;
-    agent)
-        subcmd="${2:-help}"
-        env_name="${3:-}"
-        shift 3 || true
-        prompt="$*"
-        case "$subcmd" in
-            start)  cmd_agent_start "$env_name" "$prompt" ;;
-            attach) cmd_agent_attach "$env_name" ;;
-            stop)   cmd_agent_stop "$env_name" ;;
-            status) cmd_agent_status "$env_name" ;;
-            *) die "Usage: wad agent {start|attach|stop|status} <env> [\"prompt\"]" ;;
-        esac
-        ;;
     help|--help|-h) cmd_help ;;
     version|--version|-v) echo "wad $WAD_VERSION" ;;
     *)       die "Unknown: $1" ;;

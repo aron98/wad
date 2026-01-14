@@ -17,7 +17,41 @@ services:
     stdin_open: true
     tty: true
     command: >
-      bash -lc 'set -e;         if command -v apt-get >/dev/null 2>&1; then           need_pkgs="";           command -v curl >/dev/null 2>&1 || need_pkgs=1;           command -v tmux >/dev/null 2>&1 || need_pkgs=1;           ls /usr/lib/*-linux-gnu/libxcb.so.1 >/dev/null 2>&1 || need_pkgs=1;           if [ -n "$$need_pkgs" ]; then             export DEBIAN_FRONTEND=noninteractive;             apt-get update -qq >/dev/null;             apt-get install -y -qq curl ca-certificates bzip2 tar libxcb1 tmux >/dev/null;             rm -rf /var/lib/apt/lists/*;           fi;         fi;         if ! command -v goose >/dev/null 2>&1; then           arch=$$(uname -m);           case "$$arch" in             x86_64) goose_url="https://github.com/block/goose/releases/latest/download/goose-x86_64-unknown-linux-gnu.tar.bz2" ;;             aarch64|arm64) goose_url="https://github.com/block/goose/releases/latest/download/goose-aarch64-unknown-linux-gnu.tar.bz2" ;;             *) echo "[wad] Unsupported arch for goose: $$arch" >&2; exit 1 ;;           esac;           tmp=$$(mktemp -d);           curl -fsSL "$$goose_url" -o "$$tmp/goose.tar.bz2";           tar -xjf "$$tmp/goose.tar.bz2" -C "$$tmp";           install -m 0755 "$$tmp/goose" /usr/local/bin/goose;           rm -rf "$$tmp";         fi;         if [ -d /workspace/.wad/goose ]; then           mkdir -p /root/.config/goose;           cp -a /workspace/.wad/goose/. /root/.config/goose/ 2>/dev/null || true;         fi;         touch /tmp/wad-ready;         echo "[wad] Ready.";         exec sleep infinity'
+      bash -lc 'set -e;
+        if command -v apt-get >/dev/null 2>&1; then
+          need_pkgs="";
+          command -v curl >/dev/null 2>&1 || need_pkgs=1;
+          command -v tmux >/dev/null 2>&1 || need_pkgs=1;
+          if [ -n "$$need_pkgs" ]; then
+            export DEBIAN_FRONTEND=noninteractive;
+            apt-get update -qq >/dev/null;
+            apt-get install -y -qq curl ca-certificates bzip2 tar tmux >/dev/null;
+            rm -rf /var/lib/apt/lists/*;
+          fi;
+        fi;
+
+        if ! command -v goose >/dev/null 2>&1; then
+          arch=$(uname -m);
+          case "$$arch" in
+            x86_64) goose_url="https://github.com/block/goose/releases/latest/download/goose-x86_64-unknown-linux-gnu.tar.bz2" ;;
+            aarch64|arm64) goose_url="https://github.com/block/goose/releases/latest/download/goose-aarch64-unknown-linux-gnu.tar.bz2" ;;
+            *) echo "[wad] Unsupported arch for goose: $$arch" >&2; exit 1 ;;
+          esac;
+          tmp=$(mktemp -d);
+          curl -fsSL "$$goose_url" -o "$$tmp/goose.tar.bz2";
+          tar -xjf "$$tmp/goose.tar.bz2" -C "$$tmp";
+          install -m 0755 "$$tmp/goose" /usr/local/bin/goose;
+          rm -rf "$$tmp";
+        fi;
+
+        if [ -d /workspace/.wad/goose ]; then
+          mkdir -p /root/.config/goose;
+          cp -a /workspace/.wad/goose/. /root/.config/goose/ 2>/dev/null || true;
+        fi;
+
+        touch /tmp/wad-ready;
+        echo "[wad] Ready.";
+        exec sleep infinity'
 
 networks:
   default:

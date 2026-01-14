@@ -2,14 +2,21 @@
 # Docker compose template: .wad/compose.yml
 # Environment variables:   .wad/.env (gitignored)
 
-version: 2
+version: 3
+
+# Environment name generator (used by: wad new "<prompt>")
+namegen:
+  # Local image built by `wad init` (rebuilt automatically if missing)
+  image: wad-namegen:local
+  # Target max time for name sampling; if exceeded, wad will fall back to local slugification
+  timeout_seconds: 2
 
 ports:
   increment: 10
   exposed:
     APP: 8080
 
-# Services started with `wad run` (inside devcontainer)
+# Services started automatically by `wad new` (and manually by `wad run`)
 services:
   app:
     name: app
@@ -17,16 +24,14 @@ services:
     command: echo "Configure your app command"
     log: /tmp/app.log
 
-
-# Coding agent (runs inside the devcontainer)
+# Goose settings (runs inside the devcontainer)
 agent:
-  # For now, the only supported agent type is `goose`.
   type: goose
 
-  # Extra env vars for the agent (gitignored by default)
+  # Extra env vars for goose (gitignored by default)
   env_file: .wad/agent.env
 
-  # tmux session name used for start/attach/stop
+  # tmux session name used for attach
   session_name: wad-agent
 
   goose:

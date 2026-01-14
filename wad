@@ -59,6 +59,50 @@ check_wad_init() {
     echo "$repo_root"
 }
 
+# =============================================================================
+# Worktree-local git excludes
+# =============================================================================
+
+git_exclude_file_for_repo() {
+    # Return the absolute path to the repo's exclude file (info/exclude).
+    # Works for:
+    # - normal repos
+    # - git worktrees (where .git is a file pointing at a gitdir)
+    local repo_path="$1"
+
+    local p
+    p=$(git -C "$repo_path" rev-parse --git-path info/exclude 2>/dev/null) || return 1
+
+    # rev-parse may return a relative path (e.g. .git/info/exclude)
+    if [[ "$p" != /* ]]; then
+        p="$repo_path/$p"
+    fi
+
+    echo "$p"
+}
+
+add_to_worktree_exclude() {
+    # Add an ignore entry to the worktree's .git/info/exclude (idempotent).
+    local worktree_path="$1" line="$2"
+
+    local exclude_file
+    exclude_file=$(git_exclude_file_for_repo "$worktree_path") || return 0
+
+    mkdir -p "$(dirname "$exclude_file")"
+    touch "$exclude_file"
+
+    grep -qxF "$line" "$exclude_file" 2>/dev/null || echo "$line" >> "$exclude_file"
+}
+
+ensure_wad_worktree_files_ignored() {
+    # Ensure wad-generated files in a worktree don't show up as untracked.
+    local worktree_path="$1"
+
+    # These files are created by `wad new` inside the worktree.
+    add_to_worktree_exclude "$worktree_path" ".wad-env"
+    add_to_worktree_exclude "$worktree_path" ".wad-compose.yml"
+}
+
 slugify() {
     # Convert arbitrary text to a safe kebab-case slug suitable for:
     # - directory names
@@ -980,6 +1024,9 @@ cmd_new() {
 
     log_info "Generating docker-compose..."
     generate_compose "$repo_root" "$env_name" "$worktree_path" > "$worktree_path/.wad-compose.yml"
+
+    # Hide wad-generated files inside the worktree from `git status` / diffs.
+    ensure_wad_worktree_files_ignored "$worktree_path"
 
     log_info "Starting containers..."
     docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" up -d

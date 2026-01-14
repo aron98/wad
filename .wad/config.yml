@@ -1,0 +1,35 @@
+# WAD Configuration
+# Docker compose template: .wad/compose.yml
+# Environment variables:   .wad/.env (gitignored)
+
+version: 2
+
+ports:
+  increment: 10
+  exposed:
+    APP: 8080
+
+# Services started with `wad run` (inside devcontainer)
+services:
+  app:
+    name: app
+    workdir: /workspace
+    command: echo "Configure your app command"
+    log: /tmp/app.log
+
+
+# Coding agent (runs inside the devcontainer)
+agent:
+  # For now, the only supported agent type is `goose`.
+  type: goose
+
+  # Extra env vars for the agent (gitignored by default)
+  env_file: .wad/agent.env
+
+  # tmux session name used for start/attach/stop
+  session_name: wad-agent
+
+  goose:
+    # Directory containing goose global config (gitignored by default).
+    # This is copied into /root/.config/goose at container start.
+    config_dir: .wad/goose

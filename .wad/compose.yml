@@ -1,0 +1,24 @@
+# WAD Docker Compose Template
+# Variables: ${repo_root}, ${worktree_path}, ${env_name}, ${WAD_PORT_*}
+#
+# This is a standard docker-compose file with variable substitution.
+
+services:
+  devcontainer:
+    image: python:3.12-slim
+    working_dir: /workspace
+    volumes:
+      - ${worktree_path}:/workspace
+      - ${repo_root}/.wad/.env:/workspace/.wad/.env:ro
+      - ${repo_root}/.wad/agent.env:/workspace/.wad/agent.env:ro
+      - ${repo_root}/.wad/goose:/workspace/.wad/goose:ro
+    ports:
+      - "${WAD_PORT_APP}:8080"
+    stdin_open: true
+    tty: true
+    command: >
+      bash -lc 'set -e;         if command -v apt-get >/dev/null 2>&1; then           need_pkgs="";           command -v curl >/dev/null 2>&1 || need_pkgs=1;           command -v tmux >/dev/null 2>&1 || need_pkgs=1;           ls /usr/lib/*-linux-gnu/libxcb.so.1 >/dev/null 2>&1 || need_pkgs=1;           if [ -n "$$need_pkgs" ]; then             export DEBIAN_FRONTEND=noninteractive;             apt-get update -qq >/dev/null;             apt-get install -y -qq curl ca-certificates bzip2 tar libxcb1 tmux >/dev/null;             rm -rf /var/lib/apt/lists/*;           fi;         fi;         if ! command -v goose >/dev/null 2>&1; then           arch=$$(uname -m);           case "$$arch" in             x86_64) goose_url="https://github.com/block/goose/releases/latest/download/goose-x86_64-unknown-linux-gnu.tar.bz2" ;;             aarch64|arm64) goose_url="https://github.com/block/goose/releases/latest/download/goose-aarch64-unknown-linux-gnu.tar.bz2" ;;             *) echo "[wad] Unsupported arch for goose: $$arch" >&2; exit 1 ;;           esac;           tmp=$$(mktemp -d);           curl -fsSL "$$goose_url" -o "$$tmp/goose.tar.bz2";           tar -xjf "$$tmp/goose.tar.bz2" -C "$$tmp";           install -m 0755 "$$tmp/goose" /usr/local/bin/goose;           rm -rf "$$tmp";         fi;         if [ -d /workspace/.wad/goose ]; then           mkdir -p /root/.config/goose;           cp -a /workspace/.wad/goose/. /root/.config/goose/ 2>/dev/null || true;         fi;         touch /tmp/wad-ready;         echo "[wad] Ready.";         exec sleep infinity'
+
+networks:
+  default:
+    name: wad-${env_name}

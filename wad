@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# wad - Worktree Agent Devcontainers v2.3
+# wad - Worktree Agent Devcontainers v2.4
 # Isolated development environments using git worktrees + docker compose
 #
 # Configuration:
@@ -20,7 +20,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 BOLD='\033[1m'
 
-WAD_VERSION="2.3.0"
+WAD_VERSION="2.4.0"
 WAD_DIR=".wad"
 WAD_WORKTREES_DIR=".worktrees"
 WAD_CONFIG_FILE="config.yml"
@@ -61,29 +61,61 @@ check_wad_init() {
 # =============================================================================
 
 yaml_get() {
+    # Minimal YAML getter for simple nested maps.
+    # Supports dot-path keys like: agent.type
+    # Limitations: not a full YAML parser (no complex arrays/objects).
     local file="$1" key="$2" default="$3"
     [[ -f "$file" ]] || { echo "$default"; return; }
-    
-    local value=""
-    case "$key" in
-        *.*)
-            local section="${key%%.*}"
-            local subkey="${key#*.}"
-            value=$(awk -v section="$section" -v subkey="$subkey" '
-                /^[a-zA-Z_]+:/ { current_section = $1; gsub(/:/, "", current_section) }
-                current_section == section && $1 == subkey":" { 
-                    gsub(/^[^:]+:[[:space:]]*/, ""); 
-                    gsub(/[[:space:]]*#.*$/, "");
-                    gsub(/^["'"'"']|["'"'"']$/, "");
-                    print; exit 
+
+    awk -v want="$key" -v dflt="$default" '
+        function ltrim(s){ sub(/^[ \t]+/, "", s); return s }
+        function rtrim(s){ sub(/[ \t]+$/, "", s); return s }
+        function trim(s){ return rtrim(ltrim(s)) }
+        function strip_quotes(s){
+            s = trim(s)
+            if (s ~ /^\".*\"$/) { sub(/^\"/, "", s); sub(/\"$/, "", s) }
+            else if (substr(s, 1, 1) == "'" && substr(s, length(s), 1) == "'") { s = substr(s, 2, length(s)-2) }
+            return s
+        }
+        function set_stack(level, k,    i){
+            stack[level] = k
+            for (i = level + 1; i < 64; i++) delete stack[i]
+        }
+        function current_path(level,    i, p){
+            p = stack[0]
+            for (i = 1; i <= level; i++) p = p "." stack[i]
+            return p
+        }
+        BEGIN { found = 0 }
+        {
+            raw = $0
+            sub(/[[:space:]]+#.*$/, "", raw)
+            if (raw ~ /^[[:space:]]*$/) next
+
+            indent = match($0, /[^ ]/) - 1
+            if (indent < 0) indent = 0
+            level = int(indent / 2)
+
+            if (match(raw, /^[[:space:]]*[^:]+:/)) {
+                k = raw
+                sub(/:.*/, "", k)
+                k = trim(k)
+
+                v = raw
+                sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", v)
+                v = trim(v)
+
+                set_stack(level, k)
+                path = current_path(level)
+
+                if (v != "") {
+                    v = strip_quotes(v)
+                    if (path == want) { print v; found = 1; exit }
                 }
-            ' "$file")
-            ;;
-        *)
-            value=$(grep -E "^${key}:" "$file" 2>/dev/null | head -1 | sed "s/^${key}:[[:space:]]*//" | cut -d'#' -f1 | tr -d ' \t"'"'"'')
-            ;;
-    esac
-    echo "${value:-$default}"
+            }
+        }
+        END { if (!found) print dflt }
+    ' "$file"
 }
 
 get_config() {
@@ -175,35 +207,300 @@ generate_compose() {
     sed "${sed_args[@]}" "$template"
 }
 
+
+
+# =============================================================================
+# Coding agent helpers (tmux session inside devcontainer)
+# =============================================================================
+
+get_agent_config() {
+    local repo_root="$1" key="$2" default="$3"
+    get_config "$repo_root" "agent.${key}" "$default"
+}
+
+
+is_env_running() {
+    local worktree_path="$1" env_name="$2"
+    local cid
+    cid=$(docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" ps -q devcontainer 2>/dev/null || true)
+    [[ -z "$cid" ]] && return 1
+    [[ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || echo false)" == "true" ]]
+}
+
+require_env_running() {
+    local worktree_path="$1" env_name="$2"
+    if ! is_env_running "$worktree_path" "$env_name"; then
+        log_error "Environment '$env_name' is not running. Start it with: wad start $env_name"
+        return 1
+    fi
+    return 0
+}
+
+ensure_tmux_in_container() {
+    local worktree_path="$1" env_name="$2"
+    # Try to install tmux if missing (Debian-based images)
+    # Note: container startup may be installing packages too; avoid apt lock races by waiting
+    # for the startup readiness marker.
+    docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T devcontainer bash -lc '
+      if [ ! -f /tmp/wad-ready ]; then
+        for i in $(seq 1 60); do
+          [ -f /tmp/wad-ready ] && break
+          sleep 1
+        done
+      fi
+
+      command -v tmux >/dev/null 2>&1 && exit 0
+      if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq >/dev/null && apt-get install -y -qq tmux >/dev/null && rm -rf /var/lib/apt/lists/*
+        exit 0
+      fi
+      echo "[wad] tmux not found and no supported package manager detected. Install tmux in your devcontainer image." >&2
+      exit 1
+    '
+}
+
+list_service_logs() {
+    # Return a de-duplicated list of log files for services.
+    # If a service has no `log:` configured, default to /tmp/<service>.log
+    local config_file="$1"
+
+    awk '
+        function flush() {
+            if (svc != "") {
+                if (log_path != "") print log_path;
+                else print "/tmp/" svc ".log";
+            }
+        }
+        /^services:/ { in_svc = 1; next }
+
+        # End of services section when we hit the next top-level key
+        in_svc && /^[a-zA-Z_][a-zA-Z0-9_]*:/ { flush(); exit }
+
+        in_svc && /^[[:space:]]{2}[a-zA-Z_-]+:/ {
+            flush();
+            svc = $1; gsub(/:/, "", svc);
+            log_path = "";
+            next;
+        }
+        in_svc && /^[[:space:]]{4}log:/ {
+            log_path = $0;
+            sub(/.*log:[[:space:]]*/, "", log_path);
+            gsub(/[[:space:]]*$/, "", log_path);
+            sub(/^"/, "", log_path); sub(/"$/, "", log_path);
+            sub(/^\x27/, "", log_path); sub(/\x27$/, "", log_path);
+            next;
+        }
+        END { flush() }
+    ' "$config_file" | sed '/^$/d' | sort -u
+}
+
+cmd_agent_start() {
+    local env_name="$1"
+    local prompt="$2"
+    [[ -z "$env_name" ]] && die "Usage: wad agent start <env> \"<prompt>\""
+    [[ -z "$prompt" ]] && die "Usage: wad agent start <env> \"<prompt>\""
+
+    local repo_root=$(check_wad_init)
+    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
+    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
+
+    # Do not auto-start; fail gracefully.
+    require_env_running "$worktree_path" "$env_name" || exit 1
+
+    local agent_cmd session_name env_file
+    agent_cmd="goose"
+    session_name=$(get_agent_config "$repo_root" "session_name" "wad-agent")
+    env_file=$(get_agent_config "$repo_root" "env_file" ".wad/agent.env")
+
+    local agent_type
+    agent_type=$(get_agent_config "$repo_root" "type" "")
+    [[ -z "$agent_type" ]] && die "Missing agent.type in .wad/config.yml"
+    [[ "$agent_type" != "goose" ]] && die "Unsupported agent.type: $agent_type (only goose supported)"
+
+    ensure_tmux_in_container "$worktree_path" "$env_name"
+
+    local logs
+    logs=$(list_service_logs "$repo_root/$WAD_DIR/$WAD_CONFIG_FILE" | paste -sd' ' -)
+
+    docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T \
+      -e WAD_AGENT_SESSION="$session_name" \
+      -e WAD_PROMPT="$prompt" \
+      -e WAD_AGENT_CMD="$agent_cmd" \
+      -e WAD_AGENT_ENV_FILE="$env_file" \
+      -e WAD_LOGS="$logs" \
+      devcontainer bash -lc '
+        set -e
+        session="$WAD_AGENT_SESSION"
+        agent_target="$session:agent"
+
+        if tmux has-session -t "$session" 2>/dev/null; then
+          # Send prompt to the agent window (not whichever window is currently active)
+          tmux send-keys -t "$agent_target" -- "$WAD_PROMPT" Enter
+          exit 0
+        fi
+
+        # Create a named agent window so attach can land here by default.
+        tmux new-session -d -s "$session" -n agent -c /workspace bash
+
+        # Create logs window detached so it does not become the default view.
+        if [ -n "$WAD_LOGS" ]; then
+          tmux new-window -d -t "$session" -n logs "bash -lc \"tail -n 200 -F $WAD_LOGS\""
+        fi
+
+        tmux send-keys -t "$agent_target" -- "cd /workspace" Enter
+        tmux send-keys -t "$agent_target" -- "[[ -f /workspace/.wad/.env ]] && set -a && source /workspace/.wad/.env && set +a" Enter
+        tmux send-keys -t "$agent_target" -- "[[ -f /workspace/$WAD_AGENT_ENV_FILE ]] && set -a && source /workspace/$WAD_AGENT_ENV_FILE && set +a" Enter
+        tmux send-keys -t "$agent_target" -- "$WAD_AGENT_CMD" Enter
+        tmux send-keys -t "$agent_target" -- "$WAD_PROMPT" Enter
+      '
+
+    log_success "Agent session started (tmux: $session_name)"
+    log_info "Attach: wad agent attach $env_name"
+}
+
+cmd_agent_attach() {
+    local env_name="$1"
+    [[ -z "$env_name" ]] && die "Usage: wad agent attach <env>"
+
+    local repo_root=$(check_wad_init)
+    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
+    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
+
+    require_env_running "$worktree_path" "$env_name" || exit 1
+
+    local session_name
+    session_name=$(get_agent_config "$repo_root" "session_name" "wad-agent")
+
+    if ! docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T devcontainer bash -lc "command -v tmux >/dev/null 2>&1 && tmux has-session -t '$session_name' 2>/dev/null"; then
+        die "Agent session is not running. Start it with: wad agent start $env_name \"<prompt>\""
+    fi
+
+    docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec devcontainer tmux attach -t "${session_name}:agent"
+}
+
+cmd_agent_stop() {
+    local env_name="$1"
+    [[ -z "$env_name" ]] && die "Usage: wad agent stop <env>"
+
+    local repo_root=$(check_wad_init)
+    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
+    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
+
+    require_env_running "$worktree_path" "$env_name" || exit 1
+
+    local session_name
+    session_name=$(get_agent_config "$repo_root" "session_name" "wad-agent")
+
+    docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T devcontainer tmux kill-session -t "$session_name" 2>/dev/null || true
+    log_success "Agent session stopped"
+}
+
+cmd_agent_status() {
+    local env_name="$1"
+    [[ -z "$env_name" ]] && die "Usage: wad agent status <env>"
+
+    local repo_root=$(check_wad_init)
+    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
+    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
+
+    if ! is_env_running "$worktree_path" "$env_name"; then
+        echo "stopped"
+        return 0
+    fi
+
+    local session_name
+    session_name=$(get_agent_config "$repo_root" "session_name" "wad-agent")
+
+    if docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -T devcontainer bash -lc "command -v tmux >/dev/null 2>&1 && tmux has-session -t '$session_name' 2>/dev/null"; then
+        echo "running"
+    else
+        echo "stopped"
+    fi
+}
+
 # =============================================================================
 # Commands
 # =============================================================================
 
 cmd_init() {
+    local mode="${1:-}"
+
     local repo_root
     repo_root=$(find_repo_root) || die "Not in a git repository"
-    
+
     if [[ -d "$repo_root/$WAD_DIR" ]]; then
-        log_warn "WAD already initialized"
-        return 0
+        if [[ "$mode" != "--upgrade" && "$mode" != "--force" ]]; then
+            log_warn "WAD already initialized"
+            log_info "Re-run with: wad init --upgrade"
+            return 0
+        fi
     fi
-    
+
     log_header "Initializing WAD"
-    
+
+    # Coding agent selection (for now only: goose)
+    # For --upgrade/--force we skip prompting and use goose.
+    local agent_type="goose"
+    if [[ "$mode" != "--upgrade" && "$mode" != "--force" && -t 0 ]]; then
+        read -p "Select coding agent type [goose]: " agent_type
+        agent_type=${agent_type:-goose}
+    fi
+    [[ "$agent_type" != "goose" ]] && die "Unsupported agent type: $agent_type (only goose supported)"
+
     mkdir -p "$repo_root/$WAD_DIR"
     mkdir -p "$repo_root/$WAD_WORKTREES_DIR"
-    
-    # .gitignore for secrets
-    cat > "$repo_root/$WAD_DIR/.gitignore" << 'EOF'
+
+    # Upgrade behavior: for --upgrade we backup generated templates before overwriting
+    local ts="$(date +%Y%m%d%H%M%S)"
+    local backup_dir="$repo_root/$WAD_DIR/.backup-$ts"
+
+    backup_if_exists() {
+        local f="$1"
+        [[ -f "$f" ]] || return 0
+        mkdir -p "$backup_dir"
+        cp -a "$f" "$backup_dir/"
+    }
+
+    if [[ "$mode" == "--upgrade" ]]; then
+        backup_if_exists "$repo_root/$WAD_DIR/$WAD_CONFIG_FILE"
+        backup_if_exists "$repo_root/$WAD_DIR/$WAD_COMPOSE_TEMPLATE"
+        backup_if_exists "$repo_root/$WAD_DIR/.gitignore"
+    fi    # .gitignore for secrets
+    if [[ "$mode" == "--upgrade" && -f "$repo_root/$WAD_DIR/.gitignore" ]]; then
+        add_ignore() {
+            local line="$1"
+            grep -qxF "$line" "$repo_root/$WAD_DIR/.gitignore" 2>/dev/null || echo "$line" >> "$repo_root/$WAD_DIR/.gitignore"
+        }
+        add_ignore '.env'
+        add_ignore 'agent.env'
+        add_ignore 'goose/'
+    else
+        cat > "$repo_root/$WAD_DIR/.gitignore" << 'EOF'
 .env
+agent.env
+goose/
 EOF
+    fi
     
     # Empty env file
-    cat > "$repo_root/$WAD_DIR/.env" << 'EOF'
+    if [[ "$mode" == "--force" || ! -f "$repo_root/$WAD_DIR/.env" ]]; then
+        cat > "$repo_root/$WAD_DIR/.env" << 'EOF'
 # WAD Environment Variables (gitignored - safe for secrets)
-# Sourced by: wad run, wad attach
+# Sourced by: wad run
 # Also available in devcontainer at /workspace/.wad/.env
 EOF
+    fi
+
+    # Coding agent environment file (gitignored by default; remove from .wad/.gitignore to commit it)
+    if [[ "$mode" == "--force" || ! -f "$repo_root/$WAD_DIR/agent.env" ]]; then
+        cat > "$repo_root/$WAD_DIR/agent.env" << 'EOF'
+# Environment variables for your coding agent (sourced when starting the agent session)
+# Examples (uncomment and edit):
+# GOOSE_PROVIDER=...
+# GOOSE_MODEL=...
+EOF
+    fi
     
     # Minimal config
     cat > "$repo_root/$WAD_DIR/$WAD_CONFIG_FILE" << 'EOF'
@@ -226,7 +523,121 @@ services:
     command: echo "Configure your app command"
     log: /tmp/app.log
 
+
+# Coding agent (runs inside the devcontainer)
+agent:
+  # For now, the only supported agent type is `goose`.
+  type: goose
+
+  # Extra env vars for the agent (gitignored by default)
+  env_file: .wad/agent.env
+
+  # tmux session name used for start/attach/stop
+  session_name: wad-agent
+
+  goose:
+    # Directory containing goose global config (gitignored by default).
+    # This is copied into /root/.config/goose at container start.
+    config_dir: .wad/goose
 EOF
+
+
+    # Goose global config (gitignored by default).
+    # This will be copied into /root/.config/goose inside the devcontainer at container start.
+    mkdir -p "$repo_root/$WAD_DIR/goose"
+    if [[ "$mode" == "--force" || ! -f "$repo_root/$WAD_DIR/goose/config.yaml" ]]; then
+        cat > "$repo_root/$WAD_DIR/goose/config.yaml" << 'EOF'
+GOOSE_PROVIDER:
+GOOSE_MODEL:
+extensions:
+  developer:
+    enabled: true
+    type: builtin
+    name: developer
+    description: Code editing and shell access
+    display_name: Developer Tools
+    timeout: 300
+    bundled: true
+    available_tools: []
+  code_execution:
+    enabled: false
+    type: platform
+    name: code_execution
+    description: Execute JavaScript code in a sandboxed environment
+    bundled: true
+    available_tools: []
+  chatrecall:
+    enabled: false
+    type: platform
+    name: chatrecall
+    description: Search past conversations and load session summaries for contextual memory
+    bundled: true
+    available_tools: []
+  todo:
+    enabled: true
+    type: platform
+    name: todo
+    description: Enable a todo list for goose so it can keep track of what it is doing
+    bundled: true
+    available_tools: []
+  extensionmanager:
+    enabled: true
+    type: platform
+    name: Extension Manager
+    description: Enable extension management tools for discovering, enabling, and disabling extensions
+    bundled: true
+    available_tools: []
+  skills:
+    enabled: false
+    type: platform
+    name: skills
+    description: Load and use skills from relevant directories
+    bundled: true
+    available_tools: []
+  computercontroller:
+    enabled: false
+    type: builtin
+    name: computercontroller
+    description: General computer control tools that don't require you to be a developer or engineer.
+    display_name: Computer Controller
+    timeout: 300
+    bundled: true
+    available_tools: []
+  autovisualiser:
+    enabled: false
+    type: builtin
+    name: autovisualiser
+    description: Data visualisation and UI generation tools
+    display_name: Auto Visualiser
+    timeout: 300
+    bundled: true
+    available_tools: []
+  memory:
+    enabled: true
+    type: builtin
+    name: memory
+    description: Teach goose your preferences as you go.
+    display_name: Memory
+    timeout: 300
+    bundled: true
+    available_tools: []
+  tutorial:
+    enabled: false
+    type: builtin
+    name: tutorial
+    description: Access interactive tutorials and guides
+    display_name: Tutorial
+    timeout: 300
+    bundled: true
+    available_tools: []
+GOOSE_TELEMETRY_ENABLED: true
+SECURITY_PROMPT_ENABLED: false
+GOOSE_MODE: auto
+GOOSE_DISABLE_KEYRING: ''
+GOOSE_CLI_MIN_PRIORITY: 0.2
+GOOSE_MAX_TURNS: 1000
+EOF
+    fi
     
     # Sample compose template
     cat > "$repo_root/$WAD_DIR/$WAD_COMPOSE_TEMPLATE" << 'EOF'
@@ -242,15 +653,14 @@ services:
     volumes:
       - ${worktree_path}:/workspace
       - ${repo_root}/.wad/.env:/workspace/.wad/.env:ro
+      - ${repo_root}/.wad/agent.env:/workspace/.wad/agent.env:ro
+      - ${repo_root}/.wad/goose:/workspace/.wad/goose:ro
     ports:
       - "${WAD_PORT_APP}:8080"
     stdin_open: true
     tty: true
     command: >
-      bash -c "
-        echo '[wad] Ready.'
-        exec sleep infinity
-      "
+      bash -lc 'set -e;         if command -v apt-get >/dev/null 2>&1; then           need_pkgs="";           command -v curl >/dev/null 2>&1 || need_pkgs=1;           command -v tmux >/dev/null 2>&1 || need_pkgs=1;           ls /usr/lib/*-linux-gnu/libxcb.so.1 >/dev/null 2>&1 || need_pkgs=1;           if [ -n "$$need_pkgs" ]; then             export DEBIAN_FRONTEND=noninteractive;             apt-get update -qq >/dev/null;             apt-get install -y -qq curl ca-certificates bzip2 tar libxcb1 tmux >/dev/null;             rm -rf /var/lib/apt/lists/*;           fi;         fi;         if ! command -v goose >/dev/null 2>&1; then           arch=$$(uname -m);           case "$$arch" in             x86_64) goose_url="https://github.com/block/goose/releases/latest/download/goose-x86_64-unknown-linux-gnu.tar.bz2" ;;             aarch64|arm64) goose_url="https://github.com/block/goose/releases/latest/download/goose-aarch64-unknown-linux-gnu.tar.bz2" ;;             *) echo "[wad] Unsupported arch for goose: $$arch" >&2; exit 1 ;;           esac;           tmp=$$(mktemp -d);           curl -fsSL "$$goose_url" -o "$$tmp/goose.tar.bz2";           tar -xjf "$$tmp/goose.tar.bz2" -C "$$tmp";           install -m 0755 "$$tmp/goose" /usr/local/bin/goose;           rm -rf "$$tmp";         fi;         if [ -d /workspace/.wad/goose ]; then           mkdir -p /root/.config/goose;           cp -a /workspace/.wad/goose/. /root/.config/goose/ 2>/dev/null || true;         fi;         touch /tmp/wad-ready;         echo "[wad] Ready.";         exec sleep infinity'
 
 networks:
   default:
@@ -331,7 +741,6 @@ cmd_new() {
     log_info "Commands:"
     echo "  wad shell $env_name   # Enter container"
     echo "  wad run $env_name     # Start services"
-    echo "  wad attach $env_name  # Start goose"
 }
 
 cmd_ls() {
@@ -462,8 +871,8 @@ cmd_run() {
         
         if [[ -n "$svc_cmd" ]]; then
             log_info "Starting $svc..."
-            local log_redirect=""
-            [[ -n "$svc_log" ]] && log_redirect=" >> $svc_log 2>&1"
+            [[ -z "$svc_log" ]] && svc_log="/tmp/${svc}.log"
+            local log_redirect=" >> $svc_log 2>&1"
             cmd+="$svc_env cd ${svc_workdir:-/workspace} && $svc_cmd$log_redirect & "
         fi
     done
@@ -476,21 +885,6 @@ cmd_run() {
     log_info "View logs: wad logs $env_name <service>"
 }
 
-cmd_attach() {
-    local env_name="$1"
-    [[ -z "$env_name" ]] && die "Usage: wad attach <name>"
-    
-    local repo_root=$(check_wad_init)
-    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
-    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
-    
-    local cmd=""
-    cmd+="[[ -f /workspace/.wad/.env ]] && set -a && source /workspace/.wad/.env && set +a; "
-    
-    cmd+="cd /workspace && exec goose"
-    
-    docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec devcontainer bash -c "$cmd"
-}
 
 cmd_logs() {
     local env_name="$1" service="${2:-}"
@@ -517,11 +911,10 @@ cmd_logs() {
             }
         ' "$config")
         
-        if [[ -n "$log_file" ]]; then
-            docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec devcontainer tail -f "$log_file"
-        else
-            die "Unknown service: $service"
+        if [[ -z "$log_file" ]]; then
+            log_file="/tmp/${service}.log"
         fi
+        docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec devcontainer tail -f "$log_file"
     fi
 }
 
@@ -599,7 +992,10 @@ ${BOLD}COMMANDS${NC}
   
   shell <name>      Enter container shell
   run <name>        Start services (from config.yml)
-  attach <name>     Start goose session
+  agent start <env> "<prompt>"  Start agent session and send initial prompt (requires env running)
+  agent attach <env>             Attach (tmux) to running agent session
+  agent stop <env>               Stop agent session
+  agent status <env>             Print running/stopped
   logs <name> [svc] View logs
 
 ${BOLD}CONFIGURATION${NC}
@@ -619,7 +1015,6 @@ ${BOLD}EXAMPLE${NC}
   # Edit .wad/config.yml (ports, services)
   wad new feature-x
   wad run feature-x
-  wad attach feature-x
 EOF
 }
 
@@ -633,8 +1028,20 @@ case "${1:-help}" in
     rm)      cmd_rm "${@:2}" ;;
     shell)   cmd_shell "${@:2}" ;;
     run)     cmd_run "${@:2}" ;;
-    attach)  cmd_attach "${@:2}" ;;
     logs)    cmd_logs "${@:2}" ;;
+    agent)
+        subcmd="${2:-help}"
+        env_name="${3:-}"
+        shift 3 || true
+        prompt="$*"
+        case "$subcmd" in
+            start)  cmd_agent_start "$env_name" "$prompt" ;;
+            attach) cmd_agent_attach "$env_name" ;;
+            stop)   cmd_agent_stop "$env_name" ;;
+            status) cmd_agent_status "$env_name" ;;
+            *) die "Usage: wad agent {start|attach|stop|status} <env> [\"prompt\"]" ;;
+        esac
+        ;;
     help|--help|-h) cmd_help ;;
     version|--version|-v) echo "wad $WAD_VERSION" ;;
     *)       die "Unknown: $1" ;;

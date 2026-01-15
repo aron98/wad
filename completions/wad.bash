@@ -46,7 +46,7 @@ _wad() {
   prev=$(_wad__prev_word)
 
   # Top-level commands.
-  local commands="init new attach status ls start stop rm shell run logs help version --help -h --version -v"
+  local commands="init new agent attach status ls start stop rm shell run logs mcp help version --help -h --version -v"
 
   if (( COMP_CWORD == 1 )); then
     COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
@@ -57,7 +57,7 @@ _wad() {
 
   # Complete env names for commands that take <env> as the next arg.
   case "$cmd" in
-    attach|status|start|stop|rm|shell|run|logs)
+    agent|attach|status|start|stop|rm|shell|run|logs)
       if (( COMP_CWORD == 2 )); then
         _wad__complete_envs "$cur"
         return 0

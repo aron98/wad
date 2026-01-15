@@ -64,6 +64,15 @@ mkdir -p "$INSTALL_DIR"
 cp "$SCRIPT_DIR/wad" "$INSTALL_DIR/wad"
 chmod +x "$INSTALL_DIR/wad"
 
+# Install the MCP server (vendored) so users can run `wad mcp` without pip-installing this repo.
+# We intentionally do not require Python as an install-time dependency for core WAD usage.
+MCP_DEST="${XDG_DATA_HOME_DEFAULT}/wad-mcp-server"
+log_info "Installing MCP server (vendored) to $MCP_DEST..."
+mkdir -p "$MCP_DEST"
+rm -rf "$MCP_DEST/wad_mcp_server"
+cp -R "$SCRIPT_DIR/wad_mcp_server" "$MCP_DEST/"
+log_success "MCP server installed: $MCP_DEST/wad_mcp_server"
+
 # Install bash completion (user-scope)
 COMPLETION_DIR="$XDG_DATA_HOME_DEFAULT/bash-completion/completions"
 if [[ -f "$SCRIPT_DIR/completions/wad.bash" ]]; then
@@ -90,9 +99,10 @@ echo "Usage:"
 echo "  cd your-project"
 echo "  wad init              # Initialize (creates .wad/config.yml)"
 echo "  # Edit .wad/config.yml for your project"
-echo "  wad new <name>        # Create new environment"
-echo "  wad run <name>        # Start services"
-echo "  wad agent start <name> \"help me understand this repo\"  # Start (or reuse) coding agent session"
-echo "  wad agent attach <name>                          # Attach/reconnect (interactive TTY)"
+echo "  wad new <env> [prompt...]    # Create environment (optionally start goose)"
+echo "  wad run <env>                # Start services"
+echo "  wad agent <env> \"help me understand this repo\"  # Start goose for an existing environment"
+echo "  wad attach <env>             # Attach/reconnect (interactive TTY)"
+echo "  wad mcp                      # Start the WAD MCP server (stdio)"
 echo "  wad help              # Show all commands"
 echo ""

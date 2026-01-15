@@ -65,13 +65,41 @@ cp "$SCRIPT_DIR/wad" "$INSTALL_DIR/wad"
 chmod +x "$INSTALL_DIR/wad"
 
 # Install the MCP server (vendored) so users can run `wad mcp` without pip-installing this repo.
-# We intentionally do not require Python as an install-time dependency for core WAD usage.
+# We intentionally do not require Python as an install-time dependency for *core* WAD usage,
+# but we *do* try to set up the MCP runtime so `wad mcp` works out-of-the-box.
 MCP_DEST="${XDG_DATA_HOME_DEFAULT}/wad-mcp-server"
 log_info "Installing MCP server (vendored) to $MCP_DEST..."
 mkdir -p "$MCP_DEST"
 rm -rf "$MCP_DEST/wad_mcp_server"
 cp -R "$SCRIPT_DIR/wad_mcp_server" "$MCP_DEST/"
-log_success "MCP server installed: $MCP_DEST/wad_mcp_server"
+log_success "MCP server code installed: $MCP_DEST/wad_mcp_server"
+
+# Install MCP Python dependency into an isolated venv to avoid system-Python/PEP-668 issues.
+# This keeps the host environment clean and makes `wad mcp` reliable.
+if command -v python3 >/dev/null 2>&1; then
+    if python3 -m venv --help >/dev/null 2>&1; then
+        MCP_VENV="$MCP_DEST/venv"
+        log_info "Setting up MCP Python venv at $MCP_VENV..."
+        python3 -m venv "$MCP_VENV" || log_warn "Failed to create venv at $MCP_VENV (wad mcp may still work if fastmcp is installed elsewhere)"
+
+        if [[ -x "$MCP_VENV/bin/python" ]]; then
+            # Ensure pip exists in the venv, then install fastmcp.
+            "$MCP_VENV/bin/python" -m pip --version >/dev/null 2>&1 || "$MCP_VENV/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+            "$MCP_VENV/bin/python" -m pip install -q --upgrade pip >/dev/null 2>&1 || true
+
+            log_info "Installing MCP dependency: fastmcp>=2.14.0 (venv scope)"
+            if "$MCP_VENV/bin/python" -m pip install -q "fastmcp>=2.14.0"; then
+                log_success "MCP dependency installed (venv): fastmcp"
+            else
+                log_warn "Failed to install fastmcp into venv. You can install it manually: $MCP_VENV/bin/python -m pip install 'fastmcp>=2.14.0'"
+            fi
+        fi
+    else
+        log_warn "python3 is available but venv support is missing; skipping MCP venv setup"
+    fi
+else
+    log_warn "python3 not found; skipping MCP dependency install (wad mcp will require Python)"
+fi
 
 # Install bash completion (user-scope)
 COMPLETION_DIR="$XDG_DATA_HOME_DEFAULT/bash-completion/completions"

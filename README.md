@@ -56,8 +56,9 @@ wad init
 # Edit .wad/compose.yml (your devcontainer + sidecars)
 # Edit .wad/config.yml (ports, services, goose settings)
 
-wad new "add a healthcheck endpoint and tests"
-# wad prints the generated environment name
+wad new feature-x
+
+wad agent feature-x "add a healthcheck endpoint and tests"
 
 wad attach <env>           # watch goose + logs (tmux)
 wad status <env>           # check goose completion + show JSON result (if any)
@@ -68,8 +69,9 @@ wad logs <env> goose       # tail /tmp/goose.log without attaching
 
 | Command | Description |
 |---------|-------------|
-| `wad init` | Initialize wad in current repo (writes templates + builds the local name generator image) |
-| `wad new "<prompt>"` | Create a new environment from a prompt: generates env name, creates worktree, starts containers + services, starts goose task in background |
+| `wad init` | Initialize wad in current repo (writes templates) |
+| `wad new <env> [prompt...]` | Create a new environment (starts containers + services). If prompt provided, also starts goose task in background |
+| `wad agent <env> <prompt...>` | Start goose for an existing environment |
 | `wad attach <env>` | Attach to the tmux session inside the devcontainer (requires a real TTY) |
 | `wad status <env>` | Show goose task status and (if available) the structured result JSON |
 | `wad ls` | List environments |
@@ -95,10 +97,6 @@ After `wad init`, edit `.wad/config.yml`:
 
 ```yaml
 version: 3
-
-namegen:
-  image: wad-namegen:local
-  timeout_seconds: 2
 
 ports:
   increment: 10
@@ -128,7 +126,7 @@ On `wad init`, WAD creates a generic recipe:
 
 - `.wad/goose/recipes/wad_task.yaml`
 
-On `wad new "<prompt>"`, WAD runs:
+On `wad new <env> "<prompt>"` (or `wad agent <env> "<prompt>"`), WAD runs:
 
 ```bash
 goose run --no-session \
@@ -164,7 +162,7 @@ Note: because this is **copy** semantics (not a bind mount), edits made inside t
 
 ## Attaching and logs
 
-- `wad new "<prompt>"` starts goose in a detached tmux session (`agent.session_name`, default `wad-agent`).
+- Goose runs in a detached tmux session (`agent.session_name`, default `wad-agent`).
 - `wad attach <env>` attaches you to the tmux session.
 - The tmux session also creates a `logs` window that tails:
   - `/tmp/goose.log`
@@ -177,12 +175,11 @@ To switch windows while attached:
 
 ## How it works
 
-1. `wad new "<prompt>"` generates an env name (via a small local helper image built at `wad init`)
-2. Creates a git worktree at `.worktrees/<env>` with branch `wad/<env>`
-3. Generates `.wad-env` and `.wad-compose.yml` for the worktree
-4. Starts the devcontainer (and any sidecars)
-5. Starts your configured services inside the devcontainer
-6. Launches `goose run --no-session --recipe /workspace/.wad/goose/recipes/wad_task.yaml --params task=/tmp/wad-prompt` inside tmux and returns immediately
+1. `wad new <env>` creates a git worktree at `.worktrees/<env>` with branch `wad/<env>`
+2. Generates `.wad-env` and `.wad-compose.yml` for the worktree
+3. Starts the devcontainer (and any sidecars)
+4. Starts your configured services inside the devcontainer
+5. If you provide a prompt (via `wad new <env> "<prompt>"` or `wad agent <env> "<prompt>"`), it launches `goose run --no-session --recipe /workspace/.wad/goose/recipes/wad_task.yaml --params task=/tmp/wad-prompt` inside tmux and returns immediately
 
 ## License
 

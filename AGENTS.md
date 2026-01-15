@@ -56,9 +56,10 @@ No build step exists; this is a Bash script project.
 - `wad`
   Main CLI implementation (Bash). Handles:
   - `init` — creates `.wad/` templates/config in the current repo
-  - `new` — creates a worktree, generates `.wad-env` + `.wad-compose.yml`, starts container
+  - `new` — creates a worktree, generates `.wad-env` + `.wad-compose.yml`, starts container (+ services), optionally starts goose
   - `start/stop/rm/ls/shell/logs/run` — manage environments/services
-  - `agent start/attach/stop/status` — manage goose+tmux inside the devcontainer
+  - `agent` — starts goose+tmux inside an existing environment
+  - `attach/status` — attach to tmux or check completion/result
 - `README.md`
   Canonical usage docs.
 - `install.sh`
@@ -131,10 +132,9 @@ wad logs feature-x app     # tails /tmp/app.log (or configured log path)
 Agent is **goose**, run inside tmux in the devcontainer:
 
 ```bash
-wad agent start feature-x "help me understand this repo"
-wad agent attach feature-x
-wad agent status feature-x
-wad agent stop feature-x
+wad agent feature-x "help me understand this repo"
+wad attach feature-x
+wad status feature-x
 ```
 
 ---
@@ -145,8 +145,7 @@ wad agent stop feature-x
 
 `wad` is a Bash script with a `case` dispatcher at the bottom:
 
-- `cmd_init`, `cmd_new`, `cmd_ls`, `cmd_start`, `cmd_stop`, `cmd_rm`, `cmd_shell`, `cmd_run`, `cmd_logs`
-- agent commands: `cmd_agent_start`, `cmd_agent_attach`, `cmd_agent_stop`, `cmd_agent_status`
+- `cmd_init`, `cmd_new`, `cmd_agent`, `cmd_attach`, `cmd_status`, `cmd_ls`, `cmd_start`, `cmd_stop`, `cmd_rm`, `cmd_shell`, `cmd_run`, `cmd_logs`
 
 ### YAML parsing
 
@@ -185,7 +184,7 @@ Agent/tmux helper `ensure_tmux_in_container()` waits for `/tmp/wad-ready` to avo
 - `wad rm <env>` may need to delete root-owned files created by containers on bind mounts.
   It tries `git worktree remove`, and if that fails it runs an `alpine` container to delete **uid 0-owned** paths before retrying.
 
-- `wad agent attach` requires a real TTY (it uses `tmux attach` inside `docker compose exec`).
+- `wad attach` requires a real TTY (it uses `tmux attach` inside `docker compose exec`).
 
 - Goose config is copied into the container (not bind-mounted). Changing `/root/.config/goose` inside the container does **not** sync back.
 
@@ -219,9 +218,8 @@ There is no formal test suite in this repo. Suggested manual checks after editin
 3. If touching agent features, also:
 
    ```bash
-   wad agent start test-env "say hello"
-   wad agent status test-env
-   wad agent stop test-env
+   wad agent test-env "say hello"
+   wad status test-env
    ```
 
 ---

@@ -59,6 +59,77 @@ check_wad_init() {
     echo "$repo_root"
 }
 
+slugify() {
+    # Convert arbitrary text to a safe kebab-case slug suitable for:
+    # - directory names
+    # - compose project suffixes
+    # - git branch suffixes
+    local s="$*"
+    s=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')
+    # Replace any non-alnum with '-'
+    s=$(printf '%s' "$s" | sed -E 's/[^a-z0-9]+/-/g')
+    # Collapse repeated '-', trim leading/trailing '-'
+    s=$(printf '%s' "$s" | sed -E 's/-+/-/g; s/^-+//; s/-+$//')
+    # Limit length (avoid absurdly long branch/worktree names)
+    s=$(printf '%s' "$s" | cut -c1-48)
+    [[ -z "$s" ]] && s="env"
+    printf '%s' "$s"
+}
+
+make_title_from_prompt() {
+    # Heuristic fallback title generator: first ~8 words.
+    local p="$*"
+    p=$(printf '%s' "$p" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ +//; s/ +$//')
+    p=$(printf '%s' "$p" | awk '{out=""; for(i=1;i<=NF && i<=8;i++){out=out (i==1?"":" ") $i} print out}')
+    [[ -z "$p" ]] && p="Task"
+    printf '%s' "$p"
+}
+
+extract_last_json_object() {
+    # Extract the last JSON object from arbitrary stdout.
+    # Prints the JSON object or nothing.
+    python - <<'PY'
+import json, sys
+s = sys.stdin.read()
+
+for i in range(len(s) - 1, -1, -1):
+    if s[i] != '}':
+        continue
+    depth = 0
+    for j in range(i, -1, -1):
+        c = s[j]
+        if c == '}':
+            depth += 1
+        elif c == '{':
+            depth -= 1
+            if depth == 0:
+                candidate = s[j:i+1]
+                try:
+                    json.loads(candidate)
+                except Exception:
+                    break
+                print(candidate)
+                sys.exit(0)
+
+sys.exit(0)
+PY
+}
+
+
+ensure_unique_env_name() {
+    local repo_root="$1" base="$2"
+    local i=1 name="$base"
+    while :; do
+        if [[ -d "$repo_root/$WAD_WORKTREES_DIR/$name" ]] || git -C "$repo_root" show-ref --verify --quiet "refs/heads/wad/$name"; then
+            i=$((i + 1))
+            name="${base}-${i}"
+            continue
+        fi
+        echo "$name"
+        return 0
+    done
+}
+
 # =============================================================================
 # Worktree-local git excludes
 # =============================================================================

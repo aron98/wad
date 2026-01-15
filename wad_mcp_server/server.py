@@ -91,7 +91,7 @@ async def wad_stop(env: str, repo_path: str | None = None) -> dict[str, Any]:
 
 @mcp.tool(
     description=(
-        "Remove an environment: `wad rm <env> [--force]`. "
+        "Remove an environment: `wad rm <env> --force`. "
         "WARNING: removes docker resources and git worktree."
     ),
     annotations={
@@ -102,10 +102,8 @@ async def wad_stop(env: str, repo_path: str | None = None) -> dict[str, Any]:
     task=TaskConfig(mode="optional"),
 
 )
-async def wad_rm(env: str, force: bool = False, repo_path: str | None = None) -> dict[str, Any]:
-    args = ["rm", env]
-    if force:
-        args.append("--force")
+async def wad_rm(env: str, repo_path: str | None = None) -> dict[str, Any]:
+    args = ["rm", env, "--force"]
     result = await run_wad(*args, repo_path=repo_path)
     return _result_payload(result)
 

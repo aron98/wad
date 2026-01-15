@@ -1,3 +1,29 @@
+# Completion
+
+WAD ships with bash tab-completion for the `wad` command.
+
+- **Bash** (recommended):
+  - Ensure `bash-completion` is installed and enabled on your system.
+  - If you installed via `./install.sh`, the completion script is installed to:
+    - `~/.local/share/bash-completion/completions/wad`
+  - Restart your shell.
+
+- **Zsh** (via bash completion emulation):
+
+```zsh
+autoload -Uz bashcompinit && bashcompinit
+source ~/.local/share/bash-completion/completions/wad
+```
+
+This enables tab completion for:
+- top-level commands (e.g. `init`, `new`, `rm`, ...)
+- environment names (from `.worktrees/<env>`)
+- common flags (currently `wad rm --force`)
+- log targets for `wad logs <env> …` (service names from `.wad/config.yml`, plus `goose`)
+
+---
+
+
 # WAD - Worktree Agent Devcontainers
 
 Isolated development environments using git worktrees and Docker.

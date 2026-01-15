@@ -59,6 +59,37 @@ check_wad_init() {
     echo "$repo_root"
 }
 
+slugify() {
+    # Convert arbitrary text to a safe kebab-case slug suitable for:
+    # - directory names
+    # - compose project suffixes
+    # - git branch suffixes
+    local s="$*"
+    s=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')
+    # Replace any non-alnum with '-'
+    s=$(printf '%s' "$s" | sed -E 's/[^a-z0-9]+/-/g')
+    # Collapse repeated '-', trim leading/trailing '-'
+    s=$(printf '%s' "$s" | sed -E 's/-+/-/g; s/^-+//; s/-+$//')
+    # Limit length (avoid absurdly long branch/worktree names)
+    s=$(printf '%s' "$s" | cut -c1-48)
+    [[ -z "$s" ]] && s="env"
+    printf '%s' "$s"
+}
+
+ensure_unique_env_name() {
+    local repo_root="$1" base="$2"
+    local i=1 name="$base"
+    while :; do
+        if [[ -d "$repo_root/$WAD_WORKTREES_DIR/$name" ]] || git -C "$repo_root" show-ref --verify --quiet "refs/heads/wad/$name"; then
+            i=$((i + 1))
+            name="${base}-${i}"
+            continue
+        fi
+        echo "$name"
+        return 0
+    done
+}
+
 # =============================================================================
 # Worktree-local git excludes
 # =============================================================================

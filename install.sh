@@ -19,6 +19,7 @@ log_error() { echo -e "${RED}✗${NC} $1" >&2; }
 
 INSTALL_DIR="${WAD_INSTALL_DIR:-$HOME/.local/bin}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+XDG_DATA_HOME_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}"
 
 echo ""
 echo "  ╔════════════════════════════════════════╗"
@@ -62,6 +63,16 @@ mkdir -p "$INSTALL_DIR"
 # Copy wad script
 cp "$SCRIPT_DIR/wad" "$INSTALL_DIR/wad"
 chmod +x "$INSTALL_DIR/wad"
+
+# Install bash completion (user-scope)
+COMPLETION_DIR="$XDG_DATA_HOME_DEFAULT/bash-completion/completions"
+if [[ -f "$SCRIPT_DIR/completions/wad.bash" ]]; then
+    mkdir -p "$COMPLETION_DIR"
+    cp "$SCRIPT_DIR/completions/wad.bash" "$COMPLETION_DIR/wad"
+    log_success "Bash completion installed: $COMPLETION_DIR/wad"
+else
+    log_warn "Bash completion script not found (expected: $SCRIPT_DIR/completions/wad.bash)"
+fi
 
 # Check PATH
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then

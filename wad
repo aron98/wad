@@ -1176,6 +1176,87 @@ cmd_logs() {
     docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec devcontainer tail -n 200 -F "$log_file"
 }
 
+cmd_mcp() {
+    # Start the local stdio MCP server that exposes `wad` operations.
+    # Intended usage (for MCP-capable clients):
+    #   command: wad
+    #   args: ["mcp"]
+    #
+    # By default the MCP server runs `wad` in the current working directory.
+    # You can override the project root with:
+    #   wad mcp --project-root /path/to/repo
+
+    local project_root="" wad_bin="" python_bin="python3" no_install=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --project-root)
+                project_root="${2:-}"; shift 2 || true
+                ;;
+            --wad-bin)
+                wad_bin="${2:-}"; shift 2 || true
+                ;;
+            --python)
+                python_bin="${2:-}"; shift 2 || true
+                ;;
+            --no-install)
+                no_install=1; shift
+                ;;
+            -h|--help)
+                cat << EOF
+Usage: wad mcp [--project-root PATH] [--wad-bin PATH] [--python PYTHON] [--no-install]
+
+Starts the WAD MCP server over stdio.
+
+Options:
+  --project-root PATH   Directory to run wad in (sets WAD_PROJECT_ROOT)
+  --wad-bin PATH        Path to wad executable for the server (sets WAD_BIN)
+  --python PYTHON       Python executable to use (default: python3)
+  --no-install          Do not auto-install Python dependency (fastmcp)
+EOF
+                return 0
+                ;;
+            *)
+                die "Unknown arg for 'wad mcp': $1"
+                ;;
+        esac
+    done
+
+    # Prefer an installed entrypoint if it exists.
+    if command -v wad-mcp-server >/dev/null 2>&1; then
+        [[ -n "$project_root" ]] && export WAD_PROJECT_ROOT="$project_root"
+        [[ -n "$wad_bin" ]] && export WAD_BIN="$wad_bin"
+        exec wad-mcp-server
+    fi
+
+    # Otherwise, run the vendored server code installed by install.sh.
+    local mcp_home
+    mcp_home="${WAD_MCP_SERVER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/wad-mcp-server}"
+
+    if [[ ! -d "$mcp_home/wad_mcp_server" ]] || [[ ! -f "$mcp_home/wad_mcp_server/server.py" ]]; then
+        die "MCP server code not found. Re-run install.sh or set WAD_MCP_SERVER_DIR (expected: $mcp_home/wad_mcp_server/server.py)"
+    fi
+
+    command -v "$python_bin" >/dev/null 2>&1 || die "Python not found: $python_bin"
+
+    # Ensure FastMCP dependency is present.
+    if ! "$python_bin" -c "import fastmcp" >/dev/null 2>&1; then
+        if [[ "$no_install" -eq 1 ]]; then
+            die "Python dependency 'fastmcp' is not installed. Install it (e.g.): $python_bin -m pip install --user 'fastmcp>=2.14.0'"
+        fi
+
+        log_info "Installing Python dependency: fastmcp (user scope)"
+        "$python_bin" -m pip install --user "fastmcp>=2.14.0" || die "Failed to install fastmcp. Ensure pip is available for $python_bin"
+    fi
+
+    [[ -n "$project_root" ]] && export WAD_PROJECT_ROOT="$project_root"
+    [[ -n "$wad_bin" ]] && export WAD_BIN="$wad_bin"
+
+    # Add vendored code to module path and run the server.
+    PYTHONPATH="$mcp_home${PYTHONPATH:+:$PYTHONPATH}" exec "$python_bin" -m wad_mcp_server.server
+}
+
+
 cmd_start() {
     local env_arg="$1"
     [[ -z "$env_arg" ]] && die "Usage: wad start <env>"
@@ -1275,6 +1356,8 @@ ${BOLD}COMMANDS${NC}
   run <env>                Start services (from config.yml)
   logs <env> [svc|goose]    View logs (use 'goose' to tail /tmp/goose.log)
 
+  mcp                      Start the local stdio MCP server that exposes wad operations
+
 ${BOLD}EXAMPLE${NC}
   wad init
   wad new feature-x
@@ -1297,6 +1380,7 @@ case "${1:-help}" in
     shell)   cmd_shell "${@:2}" ;;
     run)     cmd_run "${@:2}" ;;
     logs)    cmd_logs "${@:2}" ;;
+    mcp)     cmd_mcp "${@:2}" ;;
     help|--help|-h) cmd_help ;;
     version|--version|-v) echo "wad $WAD_VERSION" ;;
     *)       die "Unknown: $1" ;;

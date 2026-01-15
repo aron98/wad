@@ -70,7 +70,7 @@ _wad() {
   prev=$(_wad__prev_word)
 
   # Top-level commands.
-  local commands="init new agent attach status ls start stop rm shell run logs help version --help -h --version -v"
+  local commands="init new agent attach status ls start stop rm shell run logs mcp help version --help -h --version -v"
 
   if (( COMP_CWORD == 1 )); then
     COMPREPLY=( $(compgen -W "$commands" -- "$cur") )

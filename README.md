@@ -33,7 +33,7 @@ Isolated development environments using git worktrees and Docker.
 - Creates git worktrees for parallel development
 - Runs each worktree in a devcontainer (add sidecars like postgres via `.wad/compose.yml`)
 - Keeps each environment isolated via a dedicated Docker network
-- Runs a **background goose task** inside the devcontainer (non-interactive `goose run --no-session --recipe ...`) and lets you attach
+- Runs a background **goose** task inside the devcontainer (non-interactive `goose run --no-session --recipe ...`) and lets you attach
 
 ## Requirements
 
@@ -49,7 +49,7 @@ cd wad
 ./install.sh
 ```
 
-## Quick Start (new simplified flow)
+## Quick Start
 
 ```bash
 cd your-project
@@ -90,7 +90,6 @@ wad logs <env> goose       # tail /tmp/goose.log without attaching
 ```text
 ENV=<env>
 ```
-
 
 ## Configuration
 
@@ -136,9 +135,9 @@ goose run --no-session \
 ```
 
 This recipe:
+
 - instructs goose not to ask questions or wait for user input
 - requires it to always finish with a structured JSON result (`completed` or `blocked`)
-
 
 ### Goose environment
 
@@ -174,13 +173,98 @@ To switch windows while attached:
 - `Ctrl+b` then `0` → `agent`
 - `Ctrl+b` then `1` → `logs`
 
-## How it works
+## MCP server (local stdio)
 
-1. `wad new <env>` creates a git worktree at `.worktrees/<env>` with branch `wad/<env>`
-2. Generates `.wad-env` and `.wad-compose.yml` for the worktree
-3. Starts the devcontainer (and any sidecars)
-4. Starts your configured services inside the devcontainer
-5. If you provide a prompt (via `wad new <env> "<prompt>"` or `wad agent <env> "<prompt>"`), it launches `goose run --no-session --recipe /workspace/.wad/goose/recipes/wad_task.yaml --params task=/tmp/wad-prompt` inside tmux and returns immediately
+This repo also includes a **local stdio MCP server** that exposes `wad` operations over MCP so agents can create/manage environments.
+
+- Transport: **stdio** (intended to be launched by an MCP-capable client)
+- Implementation: **Python** using **FastMCP v2** (`fastmcp` on PyPI)
+- Long-running operations (`wad new`, `wad start`, `wad rm`, `wad agent`, `wad logs`) support **MCP background tasks** via FastMCP's `task` configuration.
+
+### Install (dev)
+
+```bash
+python -m pip install -e .
+```
+
+### Run
+
+From the project repo you want to control:
+
+```bash
+wad mcp
+```
+
+This is a convenience wrapper that:
+
+- uses `wad-mcp-server` if it's installed in your current Python environment, otherwise
+- runs a **vendored copy** of the MCP server that ships with WAD (installed by `install.sh`).
+
+#### Environment variables
+
+- `WAD_PROJECT_ROOT`: project directory to run `wad` in (defaults to current working directory)
+- `WAD_BIN`: explicit path to the `wad` executable (defaults to `./wad` if present, otherwise `wad` from `$PATH`)
+
+#### MCP client/provider configuration
+
+Because this server uses **stdio**, most MCP clients configure it as a command + args. Example (pseudo-config):
+
+```json
+{
+  "mcpServers": {
+    "wad": {
+      "command": "wad",
+      "args": ["mcp"],
+      "env": {
+        "WAD_PROJECT_ROOT": "/path/to/your-project"
+      }
+    }
+  }
+}
+```
+
+### Exposed tools
+
+- `wad_init(mode?, repo_path?)`
+- `wad_new(env, prompt?, repo_path?)` (task-capable)
+- `wad_start(env, repo_path?)` (task-capable)
+- `wad_stop(env, repo_path?)` (task-capable)
+- `wad_rm(env, force?, repo_path?)` (task-capable)
+- `wad_ls(repo_path?)`
+- `wad_run(env, repo_path?)` (task-capable)
+- `wad_logs(env, service?, repo_path?, timeout_s=5)` (task-capable; uses timeout by default to avoid infinite follow)
+- `wad_status(env, repo_path?)` (task-capable; best-effort JSON parsing)
+- `wad_agent(env, prompt, repo_path?)` (task-capable)
+- `wad_attach(env, repo_path?)` (task-capable; typically requires a TTY and may fail)
+- `wad_command(args, repo_path?, timeout_s?, max_output_chars?)` (low-level escape hatch; task-capable)
+
+### Notes
+
+- `wad` itself expects to be run in a **git repository**. If you point `WAD_PROJECT_ROOT` at a non-git directory, commands will fail.
+- This server does not currently strip WAD's ANSI color codes; most clients can handle them, but you may want to keep outputs short.
+
+## Shell completion
+
+WAD ships with bash tab-completion for the `wad` command.
+
+- **Bash** (recommended):
+  - Ensure `bash-completion` is installed and enabled on your system.
+  - If you installed via `./install.sh`, the completion script is installed to:
+    - `~/.local/share/bash-completion/completions/wad`
+  - Restart your shell.
+
+- **Zsh** (via bash completion emulation):
+
+```zsh
+autoload -Uz bashcompinit && bashcompinit
+source ~/.local/share/bash-completion/completions/wad
+```
+
+This enables tab completion for:
+
+- top-level commands (e.g. `init`, `new`, `rm`, ...)
+- environment names (from `.worktrees/<env>`)
+- common flags (currently `wad rm --force`)
 
 ## License
 

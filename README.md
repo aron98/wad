@@ -230,7 +230,7 @@ Because this server uses **stdio**, most MCP clients configure it as a command +
 - `wad_new(env, prompt?, repo_path?)` (task-capable)
 - `wad_start(env, repo_path?)` (task-capable)
 - `wad_stop(env, repo_path?)` (task-capable)
-- `wad_rm(env, force?, repo_path?)` (task-capable)
+- `wad_rm(env, repo_path?)` (task-capable)
 - `wad_ls(repo_path?)`
 - `wad_run(env, repo_path?)` (task-capable)
 - `wad_logs(env, service?, repo_path?, timeout_s=5)` (task-capable; uses timeout by default to avoid infinite follow)

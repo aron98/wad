@@ -198,7 +198,8 @@ wad mcp
 This is a convenience wrapper that:
 
 - uses `wad-mcp-server` if it's installed in your current Python environment, otherwise
-- runs a **vendored copy** of the MCP server that ships with WAD (installed by `install.sh`).
+- runs a **vendored copy** of the MCP server that ships with WAD (installed by `install.sh`),
+  and prefers the isolated venv at `~/.local/share/wad-mcp-server/venv` if present.
 
 #### Environment variables
 

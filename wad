@@ -1187,6 +1187,7 @@ cmd_mcp() {
     #   wad mcp --project-root /path/to/repo
 
     local project_root="" wad_bin="" python_bin="python3" no_install=0
+    local python_arg_set=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1197,7 +1198,7 @@ cmd_mcp() {
                 wad_bin="${2:-}"; shift 2 || true
                 ;;
             --python)
-                python_bin="${2:-}"; shift 2 || true
+                python_bin="${2:-}"; python_arg_set=1; shift 2 || true
                 ;;
             --no-install)
                 no_install=1; shift
@@ -1237,16 +1238,30 @@ EOF
         die "MCP server code not found. Re-run install.sh or set WAD_MCP_SERVER_DIR (expected: $mcp_home/wad_mcp_server/server.py)"
     fi
 
+    # If install.sh created a dedicated venv for the MCP server, prefer it by default.
+    # This avoids issues with system-managed Python environments (PEP 668) and missing user-site paths.
+    local venv_python="$mcp_home/venv/bin/python"
+    if [[ "$python_arg_set" -eq 0 ]] && [[ -x "$venv_python" ]]; then
+        python_bin="$venv_python"
+    fi
+
     command -v "$python_bin" >/dev/null 2>&1 || die "Python not found: $python_bin"
 
     # Ensure FastMCP dependency is present.
     if ! "$python_bin" -c "import fastmcp" >/dev/null 2>&1; then
         if [[ "$no_install" -eq 1 ]]; then
-            die "Python dependency 'fastmcp' is not installed. Install it (e.g.): $python_bin -m pip install --user 'fastmcp>=2.14.0'"
+            die "Python dependency 'fastmcp' is not installed. Re-run install.sh (it installs into a venv), or install manually: $python_bin -m pip install 'fastmcp>=2.14.0'"
         fi
 
-        log_info "Installing Python dependency: fastmcp (user scope)"
-        "$python_bin" -m pip install --user "fastmcp>=2.14.0" || die "Failed to install fastmcp. Ensure pip is available for $python_bin"
+        # If we're using the vendored venv, install into the venv. Otherwise fallback to user scope.
+        if [[ "$python_bin" == "$venv_python" ]]; then
+            log_info "Installing Python dependency: fastmcp (venv scope)"
+            "$python_bin" -m pip --version >/dev/null 2>&1 || "$python_bin" -m ensurepip --upgrade >/dev/null 2>&1 || true
+            "$python_bin" -m pip install "fastmcp>=2.14.0" || die "Failed to install fastmcp into MCP venv: $mcp_home/venv"
+        else
+            log_info "Installing Python dependency: fastmcp (user scope)"
+            "$python_bin" -m pip install --user "fastmcp>=2.14.0" || die "Failed to install fastmcp. Ensure pip is available for $python_bin"
+        fi
     fi
 
     [[ -n "$project_root" ]] && export WAD_PROJECT_ROOT="$project_root"

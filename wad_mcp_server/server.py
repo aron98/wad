@@ -213,5 +213,27 @@ async def wad_agent(env: str, prompt: str, repo_path: str | None = None) -> dict
 
 
 def main() -> None:
+    """Entrypoint for the stdio MCP server.
+
+    Note:
+    - `wad mcp` runs this module via `python -m wad_mcp_server.server` in some cases.
+      That requires we start the server when executed as `__main__` (see guard below).
+    - FastMCP's API has changed a bit across releases; we prefer stdio explicitly when
+      the `transport=` parameter is supported.
+    """
+
     # Stdio transport for local tool usage.
-    mcp.run()
+    try:
+        import inspect
+
+        if "transport" in inspect.signature(mcp.run).parameters:
+            mcp.run(transport="stdio")
+        else:
+            mcp.run()
+    except Exception:
+        # Fall back to the default behavior if introspection fails.
+        mcp.run()
+
+
+if __name__ == "__main__":
+    main()

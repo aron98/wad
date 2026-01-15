@@ -11,10 +11,14 @@
 #     autoload -Uz bashcompinit && bashcompinit
 #     source ~/.local/share/bash-completion/completions/wad
 
+_wad__repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null
+}
+
 _wad__list_envs() {
   # Prefer repo-local .worktrees/<env>/ directories when inside a wad-initialized repo.
   local repo_root
-  repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  repo_root=$(_wad__repo_root) || return 0
 
   local wt_dir="$repo_root/.worktrees"
   [[ -d "$wt_dir" ]] || return 0
@@ -24,6 +28,26 @@ _wad__list_envs() {
     [[ -d "$d" ]] || continue
     basename "$d"
   done
+}
+
+_wad__list_services() {
+  # Extract service names from .wad/config.yml (keys under `services:`).
+  local repo_root
+  repo_root=$(_wad__repo_root) || return 0
+
+  local cfg="$repo_root/.wad/config.yml"
+  [[ -f "$cfg" ]] || return 0
+
+  awk '
+    function ltrim(s) { sub(/^[ \t\r\n]+/, "", s); return s }
+    /^services:[[:space:]]*$/ { in_services = 1; next }
+    in_services && /^[^[:space:]]/ { exit }
+    in_services && /^[[:space:]]{2}[A-Za-z0-9_-]+:[[:space:]]*$/ {
+      line = ltrim($0)
+      sub(/:.*/, "", line)
+      print line
+    }
+  ' "$cfg" 2>/dev/null
 }
 
 _wad__prev_word() {
@@ -65,8 +89,17 @@ _wad() {
       ;;
   esac
 
-  # Flags completion.
+  # Arg/flag completion.
   case "$cmd" in
+    logs)
+      # `wad logs <env> [svc|goose]`
+      if (( COMP_CWORD == 3 )); then
+        local opts
+        opts="goose $(_wad__list_services)"
+        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+        return 0
+      fi
+      ;;
     rm)
       # `wad rm <env> [--force]`
       if (( COMP_CWORD >= 3 )); then

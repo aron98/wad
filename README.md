@@ -19,6 +19,7 @@ This enables tab completion for:
 - top-level commands (e.g. `init`, `new`, `rm`, ...)
 - environment names (from `.worktrees/<env>`)
 - common flags (currently `wad rm --force`)
+- log targets for `wad logs <env> …` (service names from `.wad/config.yml`, plus `goose`)
 
 ---
 

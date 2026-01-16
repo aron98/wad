@@ -36,6 +36,17 @@ log_header() { echo -e "\n${BOLD}${CYAN}$1${NC}\n"; }
 
 die() { log_error "$1"; exit 1; }
 
+# Run a command with a timeout if `timeout(1)` is available.
+# Usage: run_with_timeout 5s <cmd> [args...]
+run_with_timeout() {
+    local dur="$1"; shift || true
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$dur" "$@"
+    else
+        "$@"
+    fi
+}
+
 find_repo_root() {
     # Works for normal repos and git worktrees (where .git is a file)
     git rev-parse --show-toplevel 2>/dev/null
@@ -1134,8 +1145,58 @@ cmd_run() {
 }
 
 cmd_logs() {
-    local env_arg="$1" service="${2:-}"
-    [[ -z "$env_arg" ]] && die "Usage: wad logs <env> [service]"
+    local env_arg="$1"; shift || true
+    [[ -z "$env_arg" ]] && die "Usage: wad logs <env> [svc|goose] [--tail N] [--follow]"
+
+    local service=""
+    local tail_lines="${WAD_LOGS_TAIL:-200}"
+    local follow=0
+    local timeout_dur="${WAD_LOGS_TIMEOUT:-5s}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tail)
+                tail_lines="${2:-}"; shift 2 || true
+                ;;
+            --tail=*)
+                tail_lines="${1#*=}"; shift
+                ;;
+            -n)
+                tail_lines="${2:-}"; shift 2 || true
+                ;;
+            -f|--follow)
+                follow=1; shift
+                ;;
+            --timeout)
+                timeout_dur="${2:-}"; shift 2 || true
+                ;;
+            --timeout=*)
+                timeout_dur="${1#*=}"; shift
+                ;;
+            -h|--help)
+                cat << EOF
+Usage: wad logs <env> [svc|goose] [--tail N] [--follow]
+
+Defaults:
+  --tail ${WAD_LOGS_TAIL:-200}
+  (no follow; prints and exits)
+
+Notes:
+  - Without a service, prints docker compose logs for the environment.
+  - With a service name, prints the last N lines of the configured service log file inside the devcontainer.
+  - With 'goose', prints the last N lines of /tmp/goose.log inside the devcontainer.
+EOF
+                return 0
+                ;;
+            *)
+                if [[ -z "$service" ]]; then
+                    service="$1"; shift
+                else
+                    die "Unknown arg for 'wad logs': $1"
+                fi
+                ;;
+        esac
+    done
 
     local repo_root
     repo_root=$(check_wad_init)
@@ -1146,34 +1207,74 @@ cmd_logs() {
     local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
     [[ -d "$worktree_path" ]] || die "Not found: $env_name"
 
+    local compose_file="$worktree_path/.wad-compose.yml"
+    [[ -f "$compose_file" ]] || die "Missing compose file for env: $env_name ($compose_file)"
+
+    # Compose logs (fast, no TTY). Default behavior is to print and exit.
     if [[ -z "$service" ]]; then
-        docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" logs -f
+        if [[ "$follow" -eq 1 ]]; then
+            docker compose -f "$compose_file" -p "wad-$env_name" logs --no-color --tail "$tail_lines" -f
+        else
+            run_with_timeout "$timeout_dur" docker compose -f "$compose_file" -p "wad-$env_name" logs --no-color --tail "$tail_lines" || true
+        fi
         return 0
     fi
 
+    # If the container isn't running, we can't `exec` to read log files.
+    # Fall back to compose logs so callers still get something useful.
+    if ! is_env_running "$worktree_path" "$env_name"; then
+        log_warn "Environment '$env_name' is not running; cannot read in-container log files. Showing compose logs instead."
+        run_with_timeout "$timeout_dur" docker compose -f "$compose_file" -p "wad-$env_name" logs --no-color --tail "$tail_lines" || true
+        return 0
+    fi
+
+    local file_path=""
     if [[ "$service" == "goose" ]]; then
-        docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec devcontainer tail -n 200 -F /tmp/goose.log
-        return 0
+        file_path="/tmp/goose.log"
+    else
+        local config="$repo_root/$WAD_DIR/$WAD_CONFIG_FILE"
+        local log_file
+        log_file=$(awk -v svc="$service" '
+            /^services:/ { in_svc = 1; next }
+            in_svc && /^[[:space:]]{2}[a-zA-Z_-]+:/ {
+                current = $1; gsub(/:/, "", current)
+                in_current = (current == svc)
+            }
+            in_current && /log:/ {
+                gsub(/.*log:[[:space:]]*/, "");
+                gsub(/[[:space:]]*$/, "");
+                print; exit
+            }
+        ' "$config")
+
+        [[ -z "$log_file" ]] && log_file="/tmp/${service}.log"
+        file_path="$log_file"
     fi
 
-    local config="$repo_root/$WAD_DIR/$WAD_CONFIG_FILE"
-    local log_file
-    log_file=$(awk -v svc="$service" '
-        /^services:/ { in_svc = 1; next }
-        in_svc && /^[[:space:]]{2}[a-zA-Z_-]+:/ {
-            current = $1; gsub(/:/, "", current)
-            in_current = (current == svc)
-        }
-        in_current && /log:/ {
-            gsub(/.*log:[[:space:]]*/, "");
-            gsub(/[[:space:]]*$/, "");
-            print; exit
-        }
-    ' "$config")
+    local tail_cmd
+    if [[ "$follow" -eq 1 ]]; then
+        tail_cmd="tail -n $tail_lines -F '$file_path'"
+    else
+        tail_cmd="tail -n $tail_lines '$file_path'"
+    fi
 
-    [[ -z "$log_file" ]] && log_file="/tmp/${service}.log"
+    # Read the log file from inside the devcontainer.
+    # - Use -T (no TTY) so this works in MCP/CI contexts.
+    # - Do not wait for /tmp/wad-ready; logs should be best-effort.
+    # - Wrap in a timeout when not following.
+    local exec_cmd=(docker compose -f "$compose_file" -p "wad-$env_name" exec -T devcontainer bash -lc)
 
-    docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec devcontainer tail -n 200 -F "$log_file"
+    local shell_snippet
+    shell_snippet="if [ -f '$file_path' ]; then $tail_cmd; else echo '(no $file_path found)'; fi"
+
+    if [[ "$follow" -eq 1 ]]; then
+        "${exec_cmd[@]}" "$shell_snippet" || true
+    else
+        run_with_timeout "$timeout_dur" "${exec_cmd[@]}" "$shell_snippet" || {
+            log_warn "Failed to exec into devcontainer (maybe still starting). Showing compose logs instead."
+            run_with_timeout "$timeout_dur" docker compose -f "$compose_file" -p "wad-$env_name" logs --no-color --tail "$tail_lines" || true
+        }
+    fi
 }
 
 cmd_mcp() {
@@ -1369,7 +1470,8 @@ ${BOLD}COMMANDS${NC}
 
   shell <env>              Enter container shell
   run <env>                Start services (from config.yml)
-  logs <env> [svc|goose]    View logs (use 'goose' to tail /tmp/goose.log)
+  logs <env> [svc|goose] [--tail N] [--follow]
+                           View logs (default: prints and exits; use --follow to stream)
 
   mcp                      Start the local stdio MCP server that exposes wad operations
 

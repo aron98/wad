@@ -61,9 +61,11 @@ wad new feature-x
 
 wad agent feature-x "add a healthcheck endpoint and tests"
 
-wad attach <env>           # watch goose + logs (tmux)
-wad status <env>           # check goose completion + show JSON result (if any)
-wad logs <env> goose       # tail /tmp/goose.log without attaching
+wad attach <env>                     # watch goose + logs (tmux)
+wad status <env>                     # check goose completion + show JSON result (if any)
+wad logs <env> --tail 200            # print recent docker compose logs and exit
+wad logs <env> goose --tail 200      # print recent /tmp/goose.log content and exit
+wad logs <env> --follow              # stream docker compose logs (interactive)
 ```
 
 ## Commands
@@ -81,7 +83,7 @@ wad logs <env> goose       # tail /tmp/goose.log without attaching
 | `wad rm <env> [--force]` | Remove environment |
 | `wad shell <env>` | Enter container bash |
 | `wad run <env>` | Start services (from config.yml) |
-| `wad logs <env> [svc|goose]` | View logs (use `goose` to tail `/tmp/goose.log`) |
+| `wad logs <env> [svc|goose] [--tail N] [--follow]` | View logs (default: prints and exits; use `--follow` to stream). Uses `docker compose logs --no-color --tail N` and best-effort file reads for `goose`/services. |
 
 ### Parseable env name output
 

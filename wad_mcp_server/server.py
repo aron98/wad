@@ -137,8 +137,8 @@ async def wad_run(env: str, repo_path: str | None = None) -> dict[str, Any]:
 @mcp.tool(
     description=(
         "Show logs: `wad logs <env> [service]`. "
-        "Note: `wad logs` typically follows logs (-f) and may run indefinitely; "
-        "consider using a timeout_s."
+        "WAD defaults to printing a bounded amount of logs and exiting (no follow), "
+        "so this should be safe for unattended MCP usage."
     ),
     annotations={
         "readOnlyHint": True,

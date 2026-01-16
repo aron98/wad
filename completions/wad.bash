@@ -15,19 +15,89 @@ _wad__repo_root() {
   git rev-parse --show-toplevel 2>/dev/null
 }
 
+_wad__slugify() {
+  # Minimal slugify matching wad's behavior (approx).
+  local s="$*"
+  s=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')
+  s=$(printf '%s' "$s" | sed -E 's/[^a-z0-9]+/-/g; s/-+/-/g; s/^-+//; s/-+$//')
+  s=$(printf '%s' "$s" | cut -c1-48)
+  [[ -z "$s" ]] && s="env"
+  printf '%s' "$s"
+}
+
+_wad__worktrees_base_dir() {
+  local repo_root="$1"
+
+  local cfg="$repo_root/.wad/config.yml"
+  local base_dir=""
+
+  # Parse worktrees.base_dir from config.yml (simple nested map).
+  if [[ -f "$cfg" ]]; then
+    base_dir=$(awk '
+      function trim(s){ sub(/^[ \t]+/,"",s); sub(/[ \t]+$/,"",s); return s }
+      BEGIN{ in=0 }
+      /^worktrees:[[:space:]]*$/ { in=1; next }
+      in && /^[^[:space:]]/ { exit }
+      in && /^[[:space:]]{2}base_dir:[[:space:]]*/ {
+        v=$0; sub(/^[[:space:]]{2}base_dir:[[:space:]]*/,"",v);
+        v=trim(v);
+        sub(/^\"/,"",v); sub(/\"$/,"",v);
+        sub(/^\x27/,"",v); sub(/\x27$/,"",v);
+        print v; exit
+      }
+    ' "$cfg" 2>/dev/null)
+  fi
+
+  # Allow env var override.
+  if [[ -n "${WAD_WORKTREES_BASE_DIR:-}" ]]; then
+    base_dir="$WAD_WORKTREES_BASE_DIR"
+  fi
+
+  if [[ -z "$base_dir" ]]; then
+    local slug
+    slug=$(_wad__slugify "$(basename "$repo_root")")
+    base_dir="${XDG_CONFIG_HOME:-$HOME/.config}/wad/${slug}/worktrees"
+  fi
+
+  # Expand ~
+  if [[ "$base_dir" == "~" ]]; then
+    base_dir="$HOME"
+  elif [[ "$base_dir" == "~/"* ]]; then
+    base_dir="$HOME/${base_dir#~/}"
+  fi
+
+  # Relative paths are relative to repo_root.
+  if [[ "$base_dir" != /* ]]; then
+    base_dir="$repo_root/$base_dir"
+  fi
+
+  printf '%s' "$base_dir"
+}
+
 _wad__list_envs() {
-  # Prefer repo-local .worktrees/<env>/ directories when inside a wad-initialized repo.
+  # List envs from the preferred base dir, plus legacy .worktrees for backwards compatibility.
   local repo_root
   repo_root=$(_wad__repo_root) || return 0
 
-  local wt_dir="$repo_root/.worktrees"
-  [[ -d "$wt_dir" ]] || return 0
+  local base_dir legacy_dir
+  base_dir=$(_wad__worktrees_base_dir "$repo_root")
+  legacy_dir="$repo_root/.worktrees"
 
   local d
-  for d in "$wt_dir"/*; do
-    [[ -d "$d" ]] || continue
-    basename "$d"
-  done
+
+  if [[ -d "$base_dir" ]]; then
+    for d in "$base_dir"/*; do
+      [[ -d "$d" ]] || continue
+      basename "$d"
+    done
+  fi
+
+  if [[ -d "$legacy_dir" ]]; then
+    for d in "$legacy_dir"/*; do
+      [[ -d "$d" ]] || continue
+      basename "$d"
+    done
+  fi
 }
 
 _wad__list_services() {

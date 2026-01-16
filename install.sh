@@ -64,6 +64,12 @@ mkdir -p "$INSTALL_DIR"
 cp "$SCRIPT_DIR/wad" "$INSTALL_DIR/wad"
 chmod +x "$INSTALL_DIR/wad"
 
+
+# Ensure WAD config root exists (used for default worktree storage)
+XDG_CONFIG_HOME_DEFAULT="${XDG_CONFIG_HOME:-$HOME/.config}"
+mkdir -p "$XDG_CONFIG_HOME_DEFAULT/wad"
+log_success "WAD config root ready: $XDG_CONFIG_HOME_DEFAULT/wad"
+
 # Install the MCP server (vendored) so users can run `wad mcp` without pip-installing this repo.
 # We intentionally do not require Python as an install-time dependency for *core* WAD usage,
 # but we *do* try to set up the MCP runtime so `wad mcp` works out-of-the-box.

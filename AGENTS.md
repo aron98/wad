@@ -2,7 +2,7 @@
 
 This repository provides **`wad`**, a small Bash CLI that:
 
-- creates **git worktrees** for parallel development (`.worktrees/<env>`)
+- creates **git worktrees** for parallel development (default: `~/.config/wad/<repo-name>/worktrees/<env>`, legacy: `.worktrees/<env>`)
 - generates a per-worktree **docker compose** file from a template
 - starts an isolated **devcontainer** per worktree (one Docker network per env)
 - optionally starts/attaches a **goose** coding agent in a **tmux** session inside the devcontainer
@@ -23,7 +23,7 @@ The repo is intentionally minimal: the product is the `wad` script plus document
 
 - **Repo root**: discovered via `git rev-parse --show-toplevel`
 - **WAD directory**: `.wad/` (created in *the target project repo* by `wad init`)
-- **Worktrees directory**: `.worktrees/<env>/` (created in the target project repo)
+- **Worktrees directory**: `~/.config/wad/<repo-name>/worktrees/<env>` (default) or `.worktrees/<env>` (legacy)
 - **Environment**: a named worktree + a docker compose project + a dedicated Docker network `wad-<env>`
 - **Devcontainer**: the `devcontainer` service in the generated compose file
 - **Agent session**: a tmux session inside the devcontainer (default `wad-agent`)
@@ -83,9 +83,9 @@ When a user runs `wad init` inside some project repo, WAD creates:
 
 When a user runs `wad new <env>` WAD creates:
 
-- `.worktrees/<env>/.wad-env`
+- `~/.config/wad/<repo-name>/worktrees/<env>/.wad-env` (default) or `.worktrees/<env>/.wad-env` (legacy)
   Computed env + port mapping variables.
-- `.worktrees/<env>/.wad-compose.yml`
+- `~/.config/wad/<repo-name>/worktrees/<env>/.wad-compose.yml` (default) or `.worktrees/<env>/.wad-compose.yml` (legacy)
   Generated compose file (template with substitutions).
 
 ---
@@ -104,7 +104,7 @@ wad init
 
 ```bash
 wad new feature-x
-# creates git branch wad/feature-x + worktree at .worktrees/feature-x
+# creates git branch wad/feature-x + worktree at ~/.config/wad/<repo-name>/worktrees/feature-x (default)
 # generates .wad-env and .wad-compose.yml
 # docker compose up -d
 ```

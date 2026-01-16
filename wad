@@ -24,7 +24,8 @@ BOLD='\033[1m'
 
 WAD_VERSION="3.0.0"
 WAD_DIR=".wad"
-WAD_WORKTREES_DIR=".worktrees"
+# Legacy location (repo-local). Still supported for existing environments.
+WAD_LEGACY_WORKTREES_DIR=".worktrees"
 WAD_CONFIG_FILE="config.yml"
 WAD_COMPOSE_TEMPLATE="compose.yml"
 
@@ -72,6 +73,149 @@ slugify() {
     s=$(printf '%s' "$s" | cut -c1-48)
     [[ -z "$s" ]] && s="env"
     printf '%s' "$s"
+}
+
+
+# =============================================================================
+# Worktree base directory resolution
+# =============================================================================
+
+wad_xdg_config_home() {
+    echo "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+
+wad_state_root() {
+    echo "$(wad_xdg_config_home)/wad"
+}
+
+wad_repo_slug() {
+    local repo_root="$1"
+    slugify "$(basename "$repo_root")"
+}
+
+wad_repo_state_dir() {
+    local repo_root="$1"
+    echo "$(wad_state_root)/$(wad_repo_slug "$repo_root")"
+}
+
+expand_tilde_path() {
+    local p="$1"
+    if [[ "$p" == "~" ]]; then
+        echo "$HOME"
+        return 0
+    fi
+    if [[ "$p" == "~/"* ]]; then
+        echo "$HOME/${p#~/}"
+        return 0
+    fi
+    echo "$p"
+}
+
+normalize_path() {
+    # Best-effort normalization. If realpath is available, use it.
+    local p="$1"
+    if command -v realpath >/dev/null 2>&1; then
+        realpath -m "$p" 2>/dev/null || echo "$p"
+    else
+        echo "$p"
+    fi
+}
+
+worktrees_base_dir_for_repo() {
+    # Determine the base directory for worktrees for this repo.
+    # Precedence:
+    #   1) $WAD_WORKTREES_BASE_DIR (optional override)
+    #   2) .wad/config.yml: worktrees.base_dir
+    #   3) default: ~/.config/wad/<repo-name>/worktrees
+    local repo_root="$1"
+
+    local configured=""
+    configured=$(get_config "$repo_root" "worktrees.base_dir" "")
+
+    local base_dir="${WAD_WORKTREES_BASE_DIR:-$configured}"
+    if [[ -z "$base_dir" ]]; then
+        base_dir="$(wad_repo_state_dir "$repo_root")/worktrees"
+    fi
+
+    base_dir=$(expand_tilde_path "$base_dir")
+    # If the path is relative, treat it as relative to the repo root.
+    if [[ "$base_dir" != /* ]]; then
+        base_dir="$repo_root/$base_dir"
+    fi
+
+    base_dir=$(normalize_path "$base_dir")
+
+    [[ -n "$base_dir" ]] || die "Invalid worktrees base_dir (empty). Set worktrees.base_dir in $WAD_DIR/$WAD_CONFIG_FILE"
+    [[ "$base_dir" != "/" ]] || die "Refusing to use '/' as worktrees.base_dir"
+
+    echo "$base_dir"
+}
+
+ensure_dir_writable() {
+    local dir="$1" what="$2"
+    mkdir -p "$dir" 2>/dev/null || die "Failed to create $what directory: $dir"
+    [[ -d "$dir" ]] || die "$what path exists but is not a directory: $dir"
+
+    local probe="$dir/.wad-write-test.$$"
+    : >"$probe" 2>/dev/null || die "$what directory is not writable: $dir"
+    rm -f "$probe" 2>/dev/null || true
+}
+
+ensure_repo_state_dirs() {
+    local repo_root="$1"
+    ensure_dir_writable "$(wad_state_root)" "WAD state root"
+    ensure_dir_writable "$(wad_repo_state_dir "$repo_root")" "WAD repo state"
+}
+
+ensure_worktrees_base_dir() {
+    local repo_root="$1"
+    ensure_repo_state_dirs "$repo_root"
+    local base_dir
+    base_dir=$(worktrees_base_dir_for_repo "$repo_root")
+    ensure_dir_writable "$base_dir" "WAD worktrees"
+    echo "$base_dir"
+}
+
+require_worktree_path() {
+    local repo_root="$1" env_name="$2"
+    local p
+    p=$(worktree_path_for_env_existing "$repo_root" "$env_name") || {
+        local preferred
+        preferred=$(worktrees_base_dir_for_repo "$repo_root")
+        die "Not found: $env_name (searched in: $preferred and $repo_root/$WAD_LEGACY_WORKTREES_DIR)"
+    }
+    echo "$p"
+}
+
+
+worktree_path_for_env_preferred() {
+    local repo_root="$1" env_name="$2"
+    local base_dir
+    base_dir=$(worktrees_base_dir_for_repo "$repo_root")
+    echo "$base_dir/$env_name"
+}
+
+worktree_path_for_env_existing() {
+    # Resolve an existing env path. Prefer configured base dir, but fall back
+    # to the legacy repo-local .worktrees directory for backward compatibility.
+    local repo_root="$1" env_name="$2"
+
+    local preferred legacy
+    preferred=$(worktree_path_for_env_preferred "$repo_root" "$env_name")
+    legacy="$repo_root/$WAD_LEGACY_WORKTREES_DIR/$env_name"
+
+    if [[ -d "$preferred" ]]; then
+        echo "$preferred"
+        return 0
+    fi
+    if [[ -d "$legacy" ]]; then
+        log_warn "Using legacy worktree location for '$env_name': $legacy"
+        log_warn "To keep using legacy paths, set worktrees.base_dir: $WAD_LEGACY_WORKTREES_DIR in $WAD_DIR/$WAD_CONFIG_FILE"
+        echo "$legacy"
+        return 0
+    fi
+
+    return 1
 }
 
 # =============================================================================
@@ -191,8 +335,15 @@ get_config() {
 
 get_next_env_index() {
     local repo_root="$1" max_index=-1
+
+    local worktrees_dir legacy_dir
+    worktrees_dir=$(ensure_worktrees_base_dir "$repo_root")
+    legacy_dir="$repo_root/$WAD_LEGACY_WORKTREES_DIR"
+
+    # Consider both the preferred base dir and the legacy repo-local dir so
+    # port assignments remain monotonic across migrations.
     local env_files
-    env_files=$(ls "$repo_root/$WAD_WORKTREES_DIR"/*/.wad-env 2>/dev/null || true)
+    env_files=$( (ls "$worktrees_dir"/*/.wad-env 2>/dev/null; ls "$legacy_dir"/*/.wad-env 2>/dev/null) | sort -u || true )
     for env_file in $env_files; do
         [[ -f "$env_file" ]] || continue
         local idx
@@ -231,8 +382,8 @@ EOF
 }
 
 load_env_config() {
-    local repo_root="$1" env_name="$2"
-    local env_file="$repo_root/$WAD_WORKTREES_DIR/$env_name/.wad-env"
+    local worktree_path="$1"
+    local env_file="$worktree_path/.wad-env"
     [[ -f "$env_file" ]] && source "$env_file"
 }
 
@@ -447,7 +598,12 @@ cmd_init() {
     log_header "Initializing WAD"
 
     mkdir -p "$repo_root/$WAD_DIR"
-    mkdir -p "$repo_root/$WAD_WORKTREES_DIR"
+
+    # Create repo-specific WAD state directory (for default worktree storage).
+    ensure_repo_state_dirs "$repo_root"
+
+    # Ensure the worktrees base dir exists and is writable.
+    ensure_worktrees_base_dir "$repo_root" >/dev/null
 
     # Upgrade behavior: for --upgrade we backup generated templates before overwriting
     local ts
@@ -510,6 +666,21 @@ EOF
 # Environment variables:   .wad/.env (gitignored)
 
 version: 3
+
+worktrees:
+  # Base directory where worktrees are created.
+  # Default: ~/.config/wad/<repo-name>/worktrees
+  #
+  # Notes:
+  # - If this is a relative path, it is treated as relative to the repo root.
+  # - You can also override this per-command with the env var WAD_WORKTREES_BASE_DIR.
+  #
+  # Example (legacy repo-local behavior):
+  #   base_dir: .worktrees
+  base_dir: ""
+
+  # Branch name to use as the base when creating new environments.
+  default_base: ""
 
 ports:
   increment: 10
@@ -767,11 +938,17 @@ cmd_new() {
     local repo_root
     repo_root=$(check_wad_init)
 
-    local env_name worktree_path
+    local env_name worktree_path worktrees_dir legacy_path
     env_name=$(slugify "$env_arg")
-    worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
 
-    if [[ -d "$worktree_path" ]] || git -C "$repo_root" show-ref --verify --quiet "refs/heads/wad/$env_name"; then
+    # Ensure repo-specific state dirs exist even if .wad was created by an older version.
+    ensure_repo_state_dirs "$repo_root"
+
+    worktrees_dir=$(ensure_worktrees_base_dir "$repo_root")
+    worktree_path="$worktrees_dir/$env_name"
+    legacy_path="$repo_root/$WAD_LEGACY_WORKTREES_DIR/$env_name"
+
+    if [[ -d "$worktree_path" ]] || [[ -d "$legacy_path" ]] || git -C "$repo_root" show-ref --verify --quiet "refs/heads/wad/$env_name"; then
         die "Environment already exists: $env_name (use a different name or: wad rm $env_name --force)"
     fi
 
@@ -856,7 +1033,7 @@ cmd_agent() {
 
     local env_name worktree_path
     env_name=$(slugify "$env_arg")
-    worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
+    worktree_path=$(require_worktree_path "$repo_root" "$env_name")
 
     [[ -d "$worktree_path" ]] || die "Not found: $env_name (create it first: wad new $env_name)"
 
@@ -888,8 +1065,8 @@ cmd_attach() {
     local env_name
     env_name=$(slugify "$env_arg")
 
-    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
-    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
+    local worktree_path
+    worktree_path=$(require_worktree_path "$repo_root" "$env_name")
 
     require_env_running "$worktree_path" "$env_name" || exit 1
 
@@ -914,8 +1091,8 @@ cmd_status() {
     local env_name
     env_name=$(slugify "$env_arg")
 
-    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
-    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
+    local worktree_path
+    worktree_path=$(require_worktree_path "$repo_root" "$env_name")
 
     require_env_running "$worktree_path" "$env_name" || exit 1
 
@@ -980,33 +1157,47 @@ cmd_ls() {
     echo -e "${BOLD}WAD Environments${NC}"
     echo ""
 
+    local preferred_dir legacy_dir
+    preferred_dir=$(worktrees_base_dir_for_repo "$repo_root")
+    legacy_dir="$repo_root/$WAD_LEGACY_WORKTREES_DIR"
+
     local found=0
-    for env_dir in "$repo_root/$WAD_WORKTREES_DIR"/*/; do
-        [[ -d "$env_dir" ]] || continue
-        found=1
 
-        local env_name
-        env_name=$(basename "$env_dir")
-        local env_file="$env_dir/.wad-env"
-        local compose_file="$env_dir/.wad-compose.yml"
+    list_envs_in_dir() {
+        local base="$1"
+        [[ -d "$base" ]] || return 0
+        local env_dir
+        for env_dir in "$base"/*/; do
+            [[ -d "$env_dir" ]] || continue
+            found=1
 
-        local ports=""
-        if [[ -f "$env_file" ]]; then
-            ports=$(grep '^WAD_PORT_' "$env_file" 2>/dev/null | sed 's/^WAD_PORT_//' | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-        fi
+            local env_name
+            env_name=$(basename "$env_dir")
+            local env_file="$env_dir/.wad-env"
+            local compose_file="$env_dir/.wad-compose.yml"
 
-        local status="stopped"
-        if [[ -f "$compose_file" ]]; then
-            local running
-            running=$(docker compose -f "$compose_file" -p "wad-$env_name" ps -q 2>/dev/null | wc -l)
-            [[ "$running" -gt 0 ]] && status="${GREEN}running${NC}"
-        fi
+            local ports=""
+            if [[ -f "$env_file" ]]; then
+                ports=$(grep '^WAD_PORT_' "$env_file" 2>/dev/null | sed 's/^WAD_PORT_//' | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+            fi
 
-        local branch
-        branch=$(git -C "$env_dir" branch --show-current 2>/dev/null || echo "?")
+            local status="stopped"
+            if [[ -f "$compose_file" ]]; then
+                local running
+                running=$(docker compose -f "$compose_file" -p "wad-$env_name" ps -q 2>/dev/null | wc -l)
+                [[ "$running" -gt 0 ]] && status="${GREEN}running${NC}"
+            fi
 
-        printf "  ${BOLD}%-20s${NC} %s  (%s)\n" "$env_name" "${ports:+ports:$ports }$status" "$branch"
-    done
+            local branch
+            branch=$(git -C "$env_dir" branch --show-current 2>/dev/null || echo "?")
+
+            printf "  ${BOLD}%-20s${NC} %s  (%s)\n" "$env_name" "${ports:+ports:$ports }$status" "$branch"
+        done
+    }
+
+    # Prefer the configured base dir first, then list legacy envs.
+    list_envs_in_dir "$preferred_dir"
+    list_envs_in_dir "$legacy_dir"
 
     [[ $found -eq 0 ]] && echo "  No environments found. Create one with: wad new <env> [prompt...]"
 }
@@ -1021,8 +1212,8 @@ cmd_shell() {
     local env_name
     env_name=$(slugify "$env_arg")
 
-    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
-    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
+    local worktree_path
+    worktree_path=$(require_worktree_path "$repo_root" "$env_name")
 
     docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec devcontainer bash
 }
@@ -1037,8 +1228,8 @@ cmd_run() {
     local env_name
     env_name=$(slugify "$env_arg")
 
-    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
-    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
+    local worktree_path
+    worktree_path=$(require_worktree_path "$repo_root" "$env_name")
 
     local config="$repo_root/$WAD_DIR/$WAD_CONFIG_FILE"
 
@@ -1143,8 +1334,8 @@ cmd_logs() {
     local env_name
     env_name=$(slugify "$env_arg")
 
-    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
-    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
+    local worktree_path
+    worktree_path=$(require_worktree_path "$repo_root" "$env_name")
 
     if [[ -z "$service" ]]; then
         docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" logs -f
@@ -1282,10 +1473,10 @@ cmd_start() {
     local env_name
     env_name=$(slugify "$env_arg")
 
-    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
-    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
+    local worktree_path
+    worktree_path=$(require_worktree_path "$repo_root" "$env_name")
 
-    load_env_config "$repo_root" "$env_name"
+    load_env_config "$worktree_path"
     docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" up -d
     log_success "Started"
 }
@@ -1300,8 +1491,8 @@ cmd_stop() {
     local env_name
     env_name=$(slugify "$env_arg")
 
-    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
-    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
+    local worktree_path
+    worktree_path=$(require_worktree_path "$repo_root" "$env_name")
 
     docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" stop
     log_success "Stopped"
@@ -1317,8 +1508,8 @@ cmd_rm() {
     local env_name
     env_name=$(slugify "$env_arg")
 
-    local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
-    [[ -d "$worktree_path" ]] || die "Not found: $env_name"
+    local worktree_path
+    worktree_path=$(require_worktree_path "$repo_root" "$env_name")
 
     if [[ "$force" != "--force" ]]; then
         read -p "Remove '$env_name'? [y/N] " -n 1 -r; echo

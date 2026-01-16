@@ -32,6 +32,40 @@ Isolated development environments using git worktrees and Docker.
 
 - Creates git worktrees for parallel development
 - Runs each worktree in a devcontainer (add sidecars like postgres via `.wad/compose.yml`)
+
+## Worktree storage location
+
+By default, WAD creates git worktrees under:
+
+- `~/.config/wad/<repo-name>/worktrees/<env>`
+
+This keeps your project repo clean (no `.worktrees/` directory under the repo root).
+
+### Configuring the worktree base dir
+
+You can override the default in either of these ways:
+
+1. **Per-project** in `.wad/config.yml`:
+
+   ```yaml
+   worktrees:
+     # Relative paths are resolved relative to the repo root.
+     # Example to restore legacy behavior:
+     # base_dir: .worktrees
+     base_dir: ""
+   ```
+
+2. **Per-command** via environment variable:
+
+   ```bash
+   export WAD_WORKTREES_BASE_DIR=~/.config/wad-custom/my-repo/worktrees
+   wad new feature-x
+   ```
+
+### Legacy compatibility
+
+If an environment exists under the legacy repo-local directory (`.worktrees/<env>`), WAD will still find and manage it.
+
 - Keeps each environment isolated via a dedicated Docker network
 - Runs a background **goose** task inside the devcontainer (non-interactive `goose run --no-session --recipe ...`) and lets you attach
 
@@ -64,6 +98,38 @@ wad agent feature-x "add a healthcheck endpoint and tests"
 wad attach <env>           # watch goose + logs (tmux)
 wad status <env>           # check goose completion + show JSON result (if any)
 wad logs <env> goose       # tail /tmp/goose.log without attaching
+```
+
+
+## Manual smoke test
+
+You can run this in a throwaway repo to validate basic behavior:
+
+```bash
+mkdir -p /tmp/wad-smoke && cd /tmp/wad-smoke
+rm -rf .git
+
+git init
+printf "hello\n" > README.md
+git add README.md && git commit -m "init"
+
+# Ensure you are using your modified wad (adjust path as needed)
+/path/to/wad init
+
+# Create an env (worktree should be created under ~/.config/wad/<repo>/worktrees/)
+/path/to/wad new test-env
+
+# Verify listing and shell
+/path/to/wad ls
+/path/to/wad start test-env
+/path/to/wad shell test-env
+
+# Stop and remove
+/path/to/wad stop test-env
+/path/to/wad rm test-env --force
+
+# Optional: verify legacy compatibility by using repo-local worktrees
+# (set worktrees.base_dir: .worktrees in .wad/config.yml and create another env)
 ```
 
 ## Commands
@@ -264,7 +330,7 @@ source ~/.local/share/bash-completion/completions/wad
 This enables tab completion for:
 
 - top-level commands (e.g. `init`, `new`, `rm`, ...)
-- environment names (from `.worktrees/<env>`)
+- environment names (from `~/.config/wad/<repo-name>/worktrees/<env>` by default, or legacy `.worktrees/<env>`)
 - common flags (currently `wad rm --force`)
 
 ## License

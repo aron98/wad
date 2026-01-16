@@ -34,6 +34,51 @@ log_warn() { echo -e "${YELLOW}⚠${NC} $1"; }
 log_error() { echo -e "${RED}✗${NC} $1" >&2; }
 log_header() { echo -e "\n${BOLD}${CYAN}$1${NC}\n"; }
 
+# =============================================================================
+# MCP status/progress markers
+# =============================================================================
+
+json_escape() {
+    # Escape a string for safe embedding in JSON.
+    # NOTE: We only escape the minimal set needed for our status payload.
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//"/\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    printf '%s' "$s"
+}
+
+emit_status() {
+    # Emit a machine-readable status marker line for MCP clients.
+    # Gated by WAD_MCP_STATUS=1 so normal CLI output is unchanged.
+    #
+    # Format:
+    #   WAD_STATUS {"code":"...","state":"...","message":"...","step":1,"total":7,"ts":"..."}
+    local code="$1" state="$2" message="$3" step="${4:-}" total="${5:-}"
+
+    [[ -n "${WAD_MCP_STATUS:-}" ]] || return 0
+
+    local ts
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    local json
+    json="{\"code\":\"$(json_escape "$code")\",\"state\":\"$(json_escape "$state")\",\"message\":\"$(json_escape "$message")\",\"ts\":\"$ts\""
+
+    if [[ -n "$step" ]]; then
+        json+=",\"step\":$step"
+    fi
+
+    if [[ -n "$total" ]]; then
+        json+=",\"total\":$total"
+    fi
+
+    json+="}"
+
+    echo "WAD_STATUS $json"
+}
+
 die() { log_error "$1"; exit 1; }
 
 # Run a command with a timeout if `timeout(1)` is available.
@@ -788,6 +833,8 @@ cmd_new() {
 
     log_header "Creating environment: $env_name"
 
+    emit_status "env.create" "starting" "Creating environment '$env_name'" 1 8
+
     # Base branch selection precedence:
     # 1) config: worktrees.default_base
     # 2) current branch
@@ -810,30 +857,42 @@ cmd_new() {
     local env_index
     env_index=$(get_next_env_index "$repo_root")
 
+    emit_status "env.worktree" "starting" "Creating git worktree (branch: wad/$env_name from $base_branch)" 2 8
     log_info "Creating git worktree (branch: wad/$env_name from $base_branch)..."
     git -C "$repo_root" worktree add -b "wad/$env_name" "$worktree_path" "$base_branch"
+    emit_status "env.worktree" "completed" "Git worktree created" 2 8
 
+    emit_status "env.compose" "starting" "Generating environment config" 3 8
     log_info "Generating environment config..."
     generate_env_file "$env_name" "$env_index" "$repo_root" > "$worktree_path/.wad-env"
 
+    emit_status "env.compose" "starting" "Generating docker-compose" 4 8
     log_info "Generating docker-compose..."
     generate_compose "$repo_root" "$env_name" "$worktree_path" > "$worktree_path/.wad-compose.yml"
+    emit_status "env.compose" "completed" "Compose file generated" 4 8
 
     # Hide wad-generated files inside the worktree from `git status` / diffs.
     ensure_wad_worktree_files_ignored "$worktree_path"
 
+    emit_status "env.containers" "starting" "Starting containers" 5 8
     log_info "Starting containers..."
     docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" up -d
 
+    emit_status "env.devcontainer_ready" "starting" "Waiting for devcontainer readiness" 6 8
     wait_for_devcontainer_ready "$worktree_path" "$env_name" 180 || true
+    emit_status "env.devcontainer_ready" "completed" "Devcontainer ready" 6 8
 
     # Start services automatically
     cmd_run "$env_name"
 
     # Start goose task in background (tmux) only if a prompt was provided.
     if [[ -n "$prompt" ]]; then
+        emit_status "agent.start" "starting" "Starting goose agent" 8 8
         start_goose_task "$repo_root" "$worktree_path" "$env_name" "$prompt"
+        emit_status "agent.running" "running" "Goose agent running" 8 8
     fi
+
+    emit_status "env.create" "completed" "Environment '$env_name' created" 8 8
 
     log_success "Environment '$env_name' created"
     [[ -n "$prompt" ]] && log_info "Prompt: $prompt"
@@ -873,15 +932,22 @@ cmd_agent() {
 
     log_header "Starting goose for environment: $env_name"
 
+    emit_status "agent.start" "starting" "Starting goose for environment '$env_name'" 1 3
+
     # Ensure containers are up (start if needed)
     if ! is_env_running "$worktree_path" "$env_name"; then
+        emit_status "env.containers" "starting" "Starting containers" 1 3
         log_info "Starting containers..."
         docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" up -d
     fi
 
+    emit_status "env.devcontainer_ready" "starting" "Waiting for devcontainer readiness" 2 3
     wait_for_devcontainer_ready "$worktree_path" "$env_name" 180 || true
+    emit_status "env.devcontainer_ready" "completed" "Devcontainer ready" 2 3
 
+    emit_status "agent.start" "starting" "Launching goose" 3 3
     start_goose_task "$repo_root" "$worktree_path" "$env_name" "$prompt"
+    emit_status "agent.running" "running" "Goose agent running" 3 3
 
     log_info "Next:"
     echo "  wad attach $env_name        # Watch goose + logs (tmux; requires a real TTY)"
@@ -1051,6 +1117,8 @@ cmd_run() {
     local worktree_path="$repo_root/$WAD_WORKTREES_DIR/$env_name"
     [[ -d "$worktree_path" ]] || die "Not found: $env_name"
 
+    emit_status "services.start" "starting" "Starting configured services" 7 8
+
     local config="$repo_root/$WAD_DIR/$WAD_CONFIG_FILE"
 
     # Build command to source env and start services
@@ -1139,6 +1207,8 @@ cmd_run() {
     cmd+="echo 'Services started'; sleep infinity"
 
     docker compose -f "$worktree_path/.wad-compose.yml" -p "wad-$env_name" exec -d devcontainer bash -c "$cmd"
+
+    emit_status "services.start" "completed" "Services started" 7 8
 
     log_success "Services started"
     log_info "View logs: wad logs $env_name <service>"

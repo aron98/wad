@@ -177,7 +177,71 @@ This repo also includes a **local stdio MCP server** that exposes `wad` operatio
 
 - Transport: **stdio** (intended to be launched by an MCP-capable client)
 - Implementation: **Python** using **FastMCP v2** (`fastmcp` on PyPI)
-- Long-running operations (`wad new`, `wad start`, `wad rm`, `wad agent`, `wad logs`) support **MCP background tasks** via FastMCP's `task` configuration.
+- Long-running operations (`wad new`, `wad start`, `wad rm`, `wad run`, `wad agent`) support **MCP background tasks** via FastMCP's `task` configuration.
+
+### Task status / progress updates (server-side)
+
+When a tool is invoked as an MCP background task (SEP-1686), FastMCP exposes task progress via:
+
+- `tasks/get` (polling)
+- optional server `notifications/tasks/status`
+
+WAD adds **fine-grained, machine-readable status updates** by emitting status markers from the `wad` bash script and translating them into the MCP task `statusMessage`.
+
+#### Status encoding
+
+Each update is a JSON object embedded into the MCP task `statusMessage` string:
+
+```json
+{"namespace":"wad","code":"env.devcontainer_ready","state":"starting","message":"Waiting for devcontainer readiness","step":6,"total":8,"ts":"2026-01-16T09:38:00+00:00"}
+```
+
+Fields:
+
+- `namespace`: always `"wad"`
+- `code`: stable machine-readable phase identifier
+- `state`: one of `starting | running | completed | failed`
+- `message`: human-friendly summary
+- `step` / `total`: optional step progress (for UIs)
+- `ts`: server timestamp (RFC3339)
+
+#### Emitted phase codes
+
+Environment creation (`wad_new`) emits the following `code` values:
+
+1. `env.create`
+2. `env.worktree`
+3. `env.compose`
+4. `env.containers`
+5. `env.devcontainer_ready`
+6. `services.start`
+7. `agent.start` (only if a prompt was provided)
+8. `agent.running` (only if a prompt was provided)
+
+Agent start (`wad_agent`) emits:
+
+- `agent.start`
+- `env.containers` (only if containers must be started)
+- `env.devcontainer_ready`
+- `agent.running`
+
+Agent completion (`wad_agent_wait`) emits:
+
+- `agent.start`
+- `agent.running`
+- `agent.finished` or `agent.failed`
+
+#### Client subscription guidance
+
+How clients can consume updates:
+
+- **Recommended**: call task-enabled tools as background tasks, then listen for `notifications/tasks/status` (if your MCP client surfaces them) or poll `tasks/get`.
+- `tasks/get` will return a `statusMessage` string; if it starts with `{`, parse it as JSON and read the fields above.
+
+Notes:
+
+- WAD enables status markers only when invoked via the MCP server (it sets `WAD_MCP_STATUS=1`). Normal CLI output remains unchanged.
+- Tool return payloads include a `last_status` field (best-effort) for convenience if clients did not subscribe during execution.
 
 ### Install (dev)
 
@@ -192,6 +256,56 @@ From the project repo you want to control:
 ```bash
 wad mcp
 ```
+
+### Smoke test / manual reproduction (status updates)
+
+Because this repo has no automated test suite, here are manual steps to verify MCP task status updates.
+
+#### 1) Create a throwaway git repo
+
+```bash
+mkdir -p /tmp/wad-smoke && cd /tmp/wad-smoke
+git init
+printf "hello\n" > README.md
+git add README.md && git commit -m "init"
+
+# Use this repo's wad script
+/path/to/this/repo/wad init
+```
+
+#### 2) Run the MCP server
+
+```bash
+/path/to/this/repo/wad mcp --project-root /tmp/wad-smoke --wad-bin /path/to/this/repo/wad
+```
+
+#### 3) From an MCP client
+
+- Call `wad_new(env="test-env")` as a background task.
+- Observe `tasks/get` returning a `statusMessage` string containing JSON.
+- Optionally observe `notifications/tasks/status` if your client surfaces them.
+
+Expected progression (example):
+
+- `env.create` → `env.worktree` → `env.compose` → `env.containers` → `env.devcontainer_ready` → `services.start`
+
+If you pass a prompt to `wad_new(env="test-env", prompt="...")`, you should additionally see:
+
+- `agent.start` → `agent.running`
+
+To test agent completion end-to-end in one task, call:
+
+- `wad_agent_wait(env="test-env", prompt="say hello")`
+
+Expected final status:
+
+- `agent.finished` (or `agent.failed`)
+
+Notes:
+
+- Some MCP clients (or SDKs) do not yet route task status notifications to a callback; in that case, polling `tasks/get` is sufficient.
+- Docker pulls and container setup can take several minutes on first run.
+
 
 This is a convenience wrapper that:
 
@@ -234,8 +348,7 @@ Because this server uses **stdio**, most MCP clients configure it as a command +
 - `wad_logs(env, service?, repo_path?, timeout_s=5)` (task-capable; uses timeout by default to avoid infinite follow)
 - `wad_status(env, repo_path?)` (task-capable; best-effort JSON parsing)
 - `wad_agent(env, prompt, repo_path?)` (task-capable)
-- `wad_attach(env, repo_path?)` (task-capable; typically requires a TTY and may fail)
-- `wad_command(args, repo_path?, timeout_s?, max_output_chars?)` (low-level escape hatch; task-capable)
+- `wad_agent_wait(env, prompt, repo_path?, poll_interval_s=2.0, timeout_s?)` (task-capable; starts agent and waits for completion)
 
 ### Notes
 
